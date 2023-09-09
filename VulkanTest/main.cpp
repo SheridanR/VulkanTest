@@ -19,16 +19,19 @@
 #define GLM_FORCE_RADIANS
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtx/transform.hpp>
 
 // C headers
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdint.h>
-#include <time.h>
 #include <assert.h>
 
 // C++ headers
+#include <thread>
+#include <chrono>
 #include <algorithm>
 #include <vector>
 #include <string>
@@ -56,6 +59,7 @@ struct QueueFamilyInfo {
     uint32_t queues = 0;
     bool hasPresent = false;
     bool hasGraphics = false;
+    bool hasTransfer = false;
 };
 using QueueFamilies = std::vector<QueueFamilyInfo>;
 
@@ -93,12 +97,79 @@ struct Vertex {
     }
 };
 
+struct Buffer {
+    VkBuffer buffer{};
+    VkDeviceMemory memory{};
+    
+    void destroy(VkDevice device) {
+        if (buffer != VK_NULL_HANDLE) {
+            vkDestroyBuffer(device, buffer, nullptr);
+            buffer = VK_NULL_HANDLE;
+        }
+        if (memory != VK_NULL_HANDLE) {
+            vkFreeMemory(device, memory, nullptr);
+            memory = VK_NULL_HANDLE;
+        }
+    }
+};
+
+struct Mesh {
+    Buffer vertexBuffer{};
+    Buffer indexBuffer{};
+    
+    void destroy(VkDevice device) {
+        indexBuffer.destroy(device);
+        vertexBuffer.destroy(device);
+    }
+};
+
+struct UniformBuffer {
+    Buffer buffer{};
+    void* data{};
+    
+    void destroy(VkDevice device) {
+        buffer.destroy(device);
+        // data pointer is now invalid
+        data = nullptr;
+    }
+};
+
+struct UniformBufferObject {
+    // scalars have to be aligned by N (= 4 bytes given 32 bit floats).
+    // vec2 must be aligned by 2N (= 8 bytes)
+    // vec3 or vec4 must be aligned by 4N (= 16 bytes)
+    // nested structure must be aligned by the base alignment of its members rounded up to a multiple of 16.
+    // mat4 matrix must have the same alignment as a vec4.
+    // https://registry.khronos.org/vulkan/specs/1.3-extensions/html/chap15.html#interfaces-resources-layout
+    alignas(16) glm::mat4 proj;
+    alignas(16) glm::mat4 view;
+    alignas(16) glm::mat4 model;
+};
+
+struct DescriptorPool {
+    VkDescriptorPool pool{};
+    std::vector<VkDescriptorSet> sets{};
+    
+    void destroy(VkDevice device) {
+        vkDestroyDescriptorPool(device, pool, nullptr);
+        pool = VK_NULL_HANDLE;
+        sets.clear();
+    }
+};
+
 const char glsl_vert[] = 
     "layout(location = 0) in vec4 inPosition;"
     "layout(location = 1) in vec4 inColor;"
     "layout(location = 0) out vec4 outColor;"
+    
+    "layout(binding = 0) uniform UniformBufferObject {"
+    "    mat4 proj;"
+    "    mat4 view;"
+    "    mat4 model;"
+    "} ubo;"
+    
     "void main() {"
-    "    gl_Position = inPosition;"
+    "    gl_Position = ubo.proj * ubo.view * ubo.model * inPosition;"
     "    outColor = inColor;"
     "}";
 
@@ -110,50 +181,75 @@ const char glsl_frag[] =
     "}";
 
 namespace app {
-    static bool running = false;
-    static uint64_t ticks = 0;
+    static bool running{};
+    static double time{};
+    static uint64_t ticks{};
+    
+    // uniform data
+    static UniformBufferObject ubo;
+    
+    // mesh data
     static const std::vector<Vertex> vertices = {
         {
-            {0.f, -0.5f, 0.f, 1.f},
-            {1.f,  0.f,  0.f, 1.f},
+            {-0.5f, -0.5f, -0.5f,  1.0f},
+            { 0.0f,  0.0f,  0.0f,  1.0f},
         },
         {
-            {0.5f, 0.5f, 0.f, 1.f},
-            {0.f,  1.f,  0.f, 1.f},
+            { 0.5f, -0.5f, -0.5f,  1.0f},
+            { 1.0f,  0.0f,  0.0f,  1.0f},
         },
         {
-            {-0.5f, 0.5f, 0.f, 1.f},
-            { 0.f,  0.f,  1.f, 1.f},
+            { 0.5f,  0.5f, -0.5f,  1.0f},
+            { 1.0f,  1.0f,  0.0f,  1.0f},
         },
+        {
+            {-0.5f,  0.5f, -0.5f,  1.0f},
+            { 0.0f,  1.0f,  0.0f,  1.0f},
+        },
+        {
+            {-0.5f, -0.5f,  0.5f,  1.0f},
+            { 0.0f,  0.0f,  1.0f,  1.0f},
+        },
+        {
+            { 0.5f, -0.5f,  0.5f,  1.0f},
+            { 1.0f,  0.0f,  1.0f,  1.0f},
+        },
+        {
+            { 0.5f,  0.5f,  0.5f,  1.0f},
+            { 1.0f,  1.0f,  1.0f,  1.0f},
+        },
+        {
+            {-0.5f,  0.5f,  0.5f,  1.0f},
+            { 0.0f,  1.0f,  1.0f,  1.0f},
+        },
+    };
+    static const std::vector<uint16_t> indices = {
+        0, 2, 1,
+        2, 0, 3,
+        
+        4, 5, 6,
+        6, 7, 4,
+        
+        5, 4, 0,
+        5, 0, 1,
+        
+        7, 6, 2,
+        7, 2, 3,
+        
+        5, 2, 6,
+        5, 1, 2,
+        
+        4, 3, 0,
+        4, 7, 3,
     };
 };
 
 namespace vk {
-    static GLFWwindow* window = nullptr;                            // handle to the window in the window manager (desktop)
-    static VkInstance instance = VK_NULL_HANDLE;                    // handle to the vulkan instance (mother of it all)
-    static VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;        // handle to physical device we want to use
-    static VkDevice device = VK_NULL_HANDLE;                        // handle to the logical device that does anything (GPU components we want to use)
-    static VkSurfaceKHR surface = VK_NULL_HANDLE;                   // the visible pixel data in the window, essentially
-    static VkSwapchainKHR swapChain = VK_NULL_HANDLE;               // the mechanism by which framebuffers get swapped and displayed on the surface
-    static QueueFamilies families{};                                // work horses made available by our device (GPU) each queue families owns queues -> command pools -> command buffers that do work
-    static std::vector<VkImage> swapChainImages{};                  // pixel data for every image in the swap chain
-    static VkFormat swapChainFormat{};                              // pixel format of the images in the swap chain
-    static VkExtent2D swapChainExtent{};                            // dimensions of the images in the chain (matches the surface size essentially)
-    static std::vector<VkImageView> swapChainImageViews{};          // interface to the swap chain images which framebuffers need (framebuffers are output of drawing commands)
-    static VkRenderPass renderPass = VK_NULL_HANDLE;                // a structure that defines the framebuffer attachment points for a shader
-    static VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;        // empty in my project, but defines the uniforms that will be accessed by shaders in the pipeline
-    static VkPipeline pipeline = VK_NULL_HANDLE;                    // a structure that defines the pipeline for rendering, eg: assembly, vertex shading, tesselation and geometry, fragmentation, rasterization, all the way to drawn pixels
-    static std::vector<VkFramebuffer> swapChainFramebuffers{};      // framebuffers are very simple objects, all they do is define the output between a renderpass and one or more image views. (if you want a renderpass to output to more than one image, configuring a framebuffer to have more than one attachment is the way to do it)
-    static std::vector<CommandPool> commandPools{};                 // command pools own common command buffers, so they don't need to be individually deleted when it's time to clean a command pool
-    
-    constexpr int maxImagesInFlight = 2;
-    
-    static std::vector<VkSemaphore> imageAvailableSemaphores{};     // image ready to present
-    static std::vector<VkSemaphore> renderFinishedSemaphores{};     // image presented to swap chain
-    static std::vector<VkFence> inFlightFences{};                   // waiting for an image from GPU
-    
-    static uint32_t currentFrame = 0;
-    static bool framebufferResized = false;
+    static GLFWwindow* window{};                                    // handle to the window in the window manager (desktop)
+    static VkInstance instance{};                                   // handle to the vulkan instance (mother of it all)
+    static VkPhysicalDevice physicalDevice{};                       // handle to physical device we want to use
+    static VkDevice device{};                                       // handle to the logical device that does anything (GPU components we want to use)
+    static VkSurfaceKHR surface{};                                  // the visible pixel data in the window, essentially
     
     // according to vulkan-tutorial.com, queue families are divided by their capabilities.
     // some can't do Graphics (making pixels), some can't do Presentation (putting pixels on screen), and some are seemingly identical, but differentiated by less-obvious characteristics in the hardware.
@@ -161,7 +257,47 @@ namespace vk {
     // for graphics, we need a Framebuffer (with its Images), Render Pass, and Pipeline. These all instruct a GPU _how_ to complete work.
     // Lastly, we need a Swap Chain that is used during Graphics and Presentation. The Swap Chain just decides which Images we're generating with Graphics and which we're displaying with Presentation at any moment.
     // With all of these objects in place, we can submit Queues to Work, and get stuff on the screen.
-    // Not covered:
+    
+    static QueueFamilies families{};                                // work horses made available by our device (GPU) each queue families owns queues -> command pools -> command buffers that do work
+    static std::vector<CommandPool> commandPools{};                 // command pools own common command buffers, so they don't need to be individually deleted when it's time to clean a command pool.
+    
+    // Every command pool corresponds to one queue family on creation.
+    // In my app the index of a family associates directly to its command pool in the above vector.
+    
+    // we can generate more than one image at a time by writing to different images in thes wap chain.
+    // semaphores and fences enable us to signal the GPU/CPU when frames are available on the swapchain.
+    constexpr int maxImagesInFlight = 2;
+    
+    static VkSwapchainKHR swapChain{};                              // the mechanism by which images get swapped and displayed on the surface
+    static VkFormat swapChainFormat{};                              // pixel format of the images in the swap chain
+    static VkExtent2D swapChainExtent{};                            // dimensions of the images in the chain (matches the surface size essentially)
+    static std::vector<VkImage> swapChainImages{};                  // pixel data for every image in the swap chain
+    static std::vector<VkImageView> swapChainImageViews{};          // interface to the swap chain images which framebuffers need (framebuffers are output of drawing commands)
+    
+    // framebuffers are very simple objects.
+    // all they do is define the output between a renderpass and one or more image views.
+    // if you want a renderpass to output to more than one image,
+    // configuring a framebuffer to have more than one attachment is the way to do it.
+    static std::vector<VkFramebuffer> swapChainFramebuffers{};
+    
+    static VkDescriptorSetLayout descriptorSetLayout{};             // defines uniform bindings between shader and pipeline layout
+    static VkPipelineLayout pipelineLayout{};                       // binds descriptor set layout to pipeline
+    static VkPipeline pipeline{};                                   // a structure that defines the pipeline for rendering, eg: assembly, vertex shading, tesselation and geometry, fragmentation, rasterization, all the way to drawn pixels
+    static VkRenderPass renderPass{};                               // a structure that defines the framebuffer attachment points for a shader
+    
+    static std::vector<VkSemaphore> imageAvailableSemaphores{};     // image ready to present
+    static std::vector<VkSemaphore> renderFinishedSemaphores{};     // image presented to swap chain
+    static std::vector<VkFence> inFlightFences{};                   // waiting for an image from GPU
+    
+    static uint32_t currentFrame = 0;
+    
+    // if true, the whole swapchain needs to be recreated.
+    // this happens when the window is resized, for instance.
+    // recreating the swapchain (and its images) necessitates recreating the
+    // renderpass, pipeline, and framebuffer as well.
+    static bool windowResized = false;
+    
+    // Additional topics
     // * Vertex buffers, which are lists of geometry/mesh data (3D models).
     //     * Loading models from disk happens on the CPU, the vertex buffer is then created on the GPU to store the mesh data
     //     * Complete models typically contain a tree of submeshes, meaning multiple draw calls often need to be issued to render a single object. 
@@ -172,9 +308,11 @@ namespace vk {
     // * Multisampling requires a device that supports it and a render pass + pipeline that implements it
     // * Compute shaders, ray-tracing, video encoding/decoding, presentation, transferring, etc.
     
-    // vertex buffer:
-    static VkBuffer vertexBuffer = VK_NULL_HANDLE;
-    static VkDeviceMemory vertexBufferMemory;
+    // vertex and index buffers for a mesh
+    static Mesh mesh{};
+    
+    static DescriptorPool descriptorPool{};               // descriptor pools contain descriptor sets, of which one is needed for each frame in flight
+    static std::vector<UniformBuffer> uniformBuffers{};     // uniform buffers; one buffer is needed for each frame in flight
 };
 
 QueueFamilies findQueueFamilies(VkPhysicalDevice device, VkSurfaceKHR surface) {
@@ -197,6 +335,7 @@ QueueFamilies findQueueFamilies(VkPhysicalDevice device, VkSurfaceKHR surface) {
         family.queues = property.queueCount;
         family.hasGraphics = property.queueFlags & VK_QUEUE_GRAPHICS_BIT;
         family.hasPresent = presentSupport;
+        family.hasTransfer = property.queueFlags & (VK_QUEUE_TRANSFER_BIT | VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT);
         result.push_back(family);
     }
     
@@ -351,7 +490,7 @@ static int deviceSuitability(VkPhysicalDevice device, VkSurfaceKHR surface) {
 }
 
 static void resizeWindowCallback(GLFWwindow* window, int width, int height) {
-    vk::framebufferResized = true;
+    vk::windowResized = true;
 }
 
 static GLFWwindow* initGlfw() {
@@ -542,24 +681,24 @@ static VkSwapchainKHR createSwapChain(VkSwapchainKHR oldSwapChain, GLFWwindow* w
     // in the case of images destined for post-processing or other uses,
     // change imageUsage (eg to VK_IMAGE_USAGE_TRANSFER_DST_BIT)
     
-    // set image sharing properties
-    for (auto& family : families) {
-        if (family.hasGraphics && family.hasPresent) {
-            createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-            createInfo.queueFamilyIndexCount = 0;
-            createInfo.pQueueFamilyIndices = nullptr;
-        } else {
-            // share the images between all queue families.
-            // less performant, but also less complex than transferring ownership
-            std::vector<uint32_t> indices(families.size());
-            for (int c = 0; c < indices.size(); ++c) {
-                indices[c] = families[c].index;
-            }
-            
-            createInfo.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
-            createInfo.queueFamilyIndexCount = (uint32_t)indices.size();
-            createInfo.pQueueFamilyIndices = indices.data();
+    // set image sharing properties for the swapchain
+    if (families.size() == 1) {
+        // VK_SHARING_MODE_EXCLUSIVE is more performant,
+        // but requires explicit transfer of images between queue families.
+        // that's a hassle, so only use it if we have one family.
+        createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        createInfo.queueFamilyIndexCount = 0;
+        createInfo.pQueueFamilyIndices = nullptr;
+    } else {
+        // if there are multiple families, share the images between all queue families.
+        // this is less performant, but also less complex than transferring ownership.
+        std::vector<uint32_t> indices(families.size());
+        for (int c = 0; c < indices.size(); ++c) {
+            indices[c] = families[c].index;
         }
+        createInfo.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
+        createInfo.queueFamilyIndexCount = (uint32_t)indices.size();
+        createInfo.pQueueFamilyIndices = indices.data();
     }
     
     // blending with other windows on the desktop is possible by adjusting this bit
@@ -648,11 +787,35 @@ VkShaderModule createShaderModule(VkDevice device, ShaderType type, const char* 
     return shaderModule;
 }
 
-static VkPipeline createGraphicsPipeline(VkDevice device, VkExtent2D extent, VkRenderPass renderPass) {
+// Creates the layout that binds shader uniforms to a pipeline
+static VkDescriptorSetLayout createDescriptorSetLayout(VkDevice device) {
+    VkDescriptorSetLayoutBinding uboLayoutBinding{};
+    uboLayoutBinding.binding = 0;
+    uboLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    uboLayoutBinding.descriptorCount = 1;
+    uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT; // uniform layout is for the vertex shader
+    uboLayoutBinding.pImmutableSamplers = nullptr;
+    
+    VkDescriptorSetLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutInfo.bindingCount = 1;
+    layoutInfo.pBindings = &uboLayoutBinding;
+
+    VkDescriptorSetLayout descriptorSetLayout;
+    if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &descriptorSetLayout) != VK_SUCCESS) {
+        printlog("failed to create descriptor set layout!");
+        return VK_NULL_HANDLE;
+    }
+
+    return descriptorSetLayout;
+}
+
+// Defines a whole graphics pipeline (vertex assembly, vertex shader, tesselation, geometry, fragment shader, etc)
+static VkPipeline createGraphicsPipeline(VkDevice device, const std::vector<VkDescriptorSetLayout>& layouts, VkExtent2D extent, VkRenderPass renderPass) {
     VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
     pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    pipelineLayoutInfo.setLayoutCount = 0; // Optional
-    pipelineLayoutInfo.pSetLayouts = nullptr; // Optional
+    pipelineLayoutInfo.setLayoutCount = (uint32_t)layouts.size();
+    pipelineLayoutInfo.pSetLayouts = layouts.data();
     pipelineLayoutInfo.pushConstantRangeCount = 0; // Optional
     pipelineLayoutInfo.pPushConstantRanges = nullptr; // Optional
 
@@ -899,7 +1062,73 @@ static bool createFramebuffers(
     return true;
 }
 
-uint32_t findMemoryType(VkPhysicalDevice physicalDevice, uint32_t typeFilter, VkMemoryPropertyFlags properties) {
+DescriptorPool createDescriptorPool(VkDevice device, VkDescriptorSetLayout layout, const std::vector<UniformBuffer>& uniformBuffers) {
+    DescriptorPool result{};
+    
+    const auto numDescriptorSets = (uint32_t)uniformBuffers.size();
+    assert(numDescriptorSets != 0);
+    
+    // first step is to create the descriptor pool:
+
+    VkDescriptorPoolSize poolSize{};
+    poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    poolSize.descriptorCount = numDescriptorSets;
+
+    VkDescriptorPoolCreateInfo poolInfo{};
+    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.poolSizeCount = 1;
+    poolInfo.pPoolSizes = &poolSize;
+    poolInfo.maxSets = numDescriptorSets;
+    
+    VkDescriptorPool descriptorPool;
+    if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool) != VK_SUCCESS) {
+        printlog("failed to create descriptor pool!");
+        return result;
+    }
+    
+    // then create the descriptor sets:
+    
+    std::vector<VkDescriptorSetLayout> layouts(numDescriptorSets, layout);
+    VkDescriptorSetAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = descriptorPool;
+    allocInfo.descriptorSetCount = numDescriptorSets;
+    allocInfo.pSetLayouts = layouts.data();
+    
+    result.sets.resize(numDescriptorSets);
+    if (vkAllocateDescriptorSets(device, &allocInfo, result.sets.data()) != VK_SUCCESS) {
+        vkDestroyDescriptorPool(device, descriptorPool, nullptr);
+        printlog("failed to allocate descriptor sets!");
+        return result;
+    }
+    
+    // now populate the descriptor sets:
+    
+    for (uint32_t c = 0; c < numDescriptorSets; ++c) {
+        VkDescriptorBufferInfo bufferInfo{};
+        bufferInfo.buffer = uniformBuffers[c].buffer.buffer;
+        bufferInfo.offset = 0;
+        bufferInfo.range = sizeof(UniformBufferObject);
+        
+        VkWriteDescriptorSet descriptorWrite{};
+        descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        descriptorWrite.dstSet = result.sets[c];
+        descriptorWrite.dstBinding = 0;
+        descriptorWrite.dstArrayElement = 0;
+        descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        descriptorWrite.descriptorCount = 1;
+        descriptorWrite.pBufferInfo = &bufferInfo;
+        descriptorWrite.pImageInfo = nullptr; // Optional
+        descriptorWrite.pTexelBufferView = nullptr; // Optional
+        
+        vkUpdateDescriptorSets(device, 1, &descriptorWrite, 0, nullptr);
+    }
+    
+    result.pool = descriptorPool;
+    return result;
+}
+
+static uint32_t findMemoryType(VkPhysicalDevice physicalDevice, uint32_t typeFilter, VkMemoryPropertyFlags properties) {
     VkPhysicalDeviceMemoryProperties memProperties;
     vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProperties);
     for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
@@ -910,15 +1139,14 @@ uint32_t findMemoryType(VkPhysicalDevice physicalDevice, uint32_t typeFilter, Vk
     return UINT32_MAX;
 }
 
-VkDeviceMemory allocateVertexBufferMemory(VkPhysicalDevice physicalDevice, VkDevice device, VkBuffer vertexBuffer) {
+static VkDeviceMemory allocateBufferMemory(VkPhysicalDevice physicalDevice, VkDevice device, VkBuffer buffer, VkMemoryPropertyFlags flags) {
     VkMemoryRequirements memRequirements;
-    vkGetBufferMemoryRequirements(device, vertexBuffer, &memRequirements);
+    vkGetBufferMemoryRequirements(device, buffer, &memRequirements);
     
     // find correct memory type
-    auto memTypeIndex = findMemoryType(physicalDevice, memRequirements.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    auto memTypeIndex = findMemoryType(physicalDevice, memRequirements.memoryTypeBits, flags);
     if (memTypeIndex == UINT32_MAX) {
-        printlog("unable to find memory heap for vertex buffer");
+        printlog("unable to find memory heap for vulkan buffer");
         return VK_NULL_HANDLE;
     }
     
@@ -929,40 +1157,266 @@ VkDeviceMemory allocateVertexBufferMemory(VkPhysicalDevice physicalDevice, VkDev
     allocInfo.memoryTypeIndex = memTypeIndex;
     
     // allocate memory
-    VkDeviceMemory vertexBufferMemory;
-    if (vkAllocateMemory(device, &allocInfo, nullptr, &vertexBufferMemory) != VK_SUCCESS) {
+    // NOTE the number of pages you can allocate with vkAllocateMemory is actually very low!
+    // on a GTX 1080 you will run out at 4096 calls. It is better to use a custom allocator eg:
+    // https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator
+    VkDeviceMemory deviceMemory;
+    if (vkAllocateMemory(device, &allocInfo, nullptr, &deviceMemory) != VK_SUCCESS) {
         printlog("failed to allocate vertex buffer memory!");
         return VK_NULL_HANDLE;
     }
     
-    // bind memory to vertex buffer
-    vkBindBufferMemory(device, vertexBuffer, vertexBufferMemory, 0);
+    // bind memory to buffer
+    vkBindBufferMemory(device, buffer, deviceMemory, 0);
     
-    return vertexBufferMemory;
+    return deviceMemory;
 }
 
-VkBuffer createVertexBuffer(VkDevice device, size_t bufferSize) {
+static VkBuffer createBuffer(VkDevice device, const QueueFamilies& families, VkDeviceSize bufferSize, VkBufferUsageFlags usage) {
+    assert(!families.empty());
+    assert(device != VK_NULL_HANDLE);
+    assert(bufferSize > 0);
+
     VkBufferCreateInfo bufferInfo{};
     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bufferInfo.size = bufferSize;
-    bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
-    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    bufferInfo.usage = usage;
+    
+    // set sharing mode
+    if (families.size() == 1) {
+        // VK_SHARING_MODE_EXCLUSIVE is more performant,
+        // but requires explicit transfer of images between queue families.
+        // that's a hassle, so only use it if we have one family.
+        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        bufferInfo.queueFamilyIndexCount = 0;
+        bufferInfo.pQueueFamilyIndices = nullptr;
+    } else {
+        // if there are multiple families, share the images between all queue families.
+        // this is less performant, but also less complex than transferring ownership.
+        std::vector<uint32_t> indices(families.size());
+        for (int c = 0; c < indices.size(); ++c) {
+            indices[c] = families[c].index;
+        }
+        bufferInfo.sharingMode = VK_SHARING_MODE_CONCURRENT;
+        bufferInfo.queueFamilyIndexCount = (uint32_t)indices.size();
+        bufferInfo.pQueueFamilyIndices = indices.data();
+    }
 
-    VkBuffer vertexBuffer;
-    if (vkCreateBuffer(device, &bufferInfo, nullptr, &vertexBuffer) != VK_SUCCESS) {
-        printlog("failed to create vertex buffer!");
+    VkBuffer buffer;
+    if (vkCreateBuffer(device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS) {
+        printlog("failed to create vulkan buffer!");
         return VK_NULL_HANDLE;
     }
     
-    return vertexBuffer;
+    return buffer;
 }
 
-void copyVertexDataToVertexBufferMemory(VkDevice device, VkDeviceMemory memory, const std::vector<Vertex>& vertices) {
+static bool copyBuffer(VkDevice device, VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size) {
+    // pick the first transfer capable queue to work with.
+    int familyIndex = 0;
+    VkQueue transferQueue{};
+    for (auto& family : vk::families) {
+        if (family.hasTransfer && family.queues > 0) {
+            vkGetDeviceQueue(vk::device, family.index, 0, &transferQueue);
+            break;
+        }
+        ++familyIndex;
+    }
+    if (!transferQueue) {
+        printlog("no suitable queue for transferring");
+        return false;
+    }
+    
+    // pick the command buffer associated with the command pool / queue family
+    assert(familyIndex < vk::commandPools.size());
+    auto& commandBuffer = vk::commandPools[familyIndex].buffers[vk::currentFrame];
+    
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = 0; // if this were a temporary buffer we could use VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT. but its not
+    vkBeginCommandBuffer(commandBuffer, &beginInfo);
+    
+    VkBufferCopy copyRegion{};
+    copyRegion.srcOffset = 0; // Optional
+    copyRegion.dstOffset = 0; // Optional
+    copyRegion.size = size;
+    vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+    
+    vkEndCommandBuffer(commandBuffer);
+    
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffer;
+
+    // stall CPU until transfer completes.
+    vkQueueSubmit(transferQueue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(transferQueue);
+    
+    // clearly stalling is not the only choice here.
+    // if no other queue needs access to the vertex buffer, and we have other
+    // queues available, we can easily put the other queues to work
+    // and only pause further execution when we know we need access to this
+    // vertex buffer.
+    
+    // this can be a powerful mechanism by which we stream data to the GPU
+    // without stalling execution of any pipeline.
+    
+    // note: even waiting for the queue to finish with vkQueueWaitIdle may not be most performant,
+    // because a _fence_ allows us to schedule multiple transfers and allow the driver
+    // to complete them in the order that is most optimal for it, rather than for my
+    // application.
+    
+    return true;
+}
+
+static UniformBuffer createUniformBuffer(VkDevice device, VkPhysicalDevice physicalDevice, const QueueFamilies& families) {
+    UniformBuffer result{};
+    const auto bufferSize = sizeof(UniformBufferObject);
+    
+    auto buffer = createBuffer(device, families, bufferSize,
+        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    if (!buffer) {
+        printlog("failed to create uniform buffer: buffer creation failed");
+        return result;
+    }
+    
+    auto memory = allocateBufferMemory(physicalDevice, device, buffer,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (!memory) {
+        vkDestroyBuffer(device, buffer, nullptr);
+        printlog("failed to create uniform buffer: memory allocation failed");
+        return result;
+    }
+    
+    if (vkMapMemory(device, memory, 0, bufferSize, 0, &result.data) != VK_SUCCESS) {
+        vkDestroyBuffer(device, buffer, nullptr);
+        vkFreeMemory(device, memory, nullptr);
+        printlog("failed to create uniform buffer: failed to map uniform buffer memory");
+        return result;
+    }
+    result.buffer.buffer = buffer;
+    result.buffer.memory = memory;
+    
+    return result;
+}
+
+Buffer createVertexBuffer(VkPhysicalDevice physicalDevice, VkDevice device, const QueueFamilies& families, const std::vector<Vertex>& vertices) {
+    Buffer result{};
+    VkDeviceSize bufferSize = sizeof(vertices[0]) * vertices.size();
+
+    // create staging buffer
+    auto stagingBuffer = createBuffer(device, families, bufferSize,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    if (!stagingBuffer) {
+        printlog("failed to create vertex buffer: staging buffer creation failed");
+        return result;
+    }
+    
+    // allocate staging buffer
+    auto stagingBufferMemory = allocateBufferMemory(physicalDevice, device, stagingBuffer,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (!stagingBufferMemory) {
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        printlog("failed to create vertex buffer: staging buffer memory allocation failed");
+        return result;
+    }
+
+    // map staging buffer (move data from CPU to staging buffer)
     void* data;
-    const size_t size = sizeof(vertices[0]) * vertices.size();
-    vkMapMemory(device, memory, 0, size, 0, &data);
-    memcpy(data, vertices.data(), size);
-    vkUnmapMemory(device, memory);
+    vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);
+    memcpy(data, vertices.data(), (size_t)bufferSize);
+    vkUnmapMemory(device, stagingBufferMemory);
+
+    // create vertex buffer
+    auto vertexBuffer = createBuffer(device, families, bufferSize,
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    if (!vertexBuffer) {
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingBufferMemory, nullptr);
+        printlog("failed to create vertex buffer: vertex buffer creation failed");
+        return result;
+    }
+    
+    // allocate vertex buffer memory
+    auto vertexBufferMemory = allocateBufferMemory(physicalDevice, device, vertexBuffer,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (!vertexBufferMemory) {
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingBufferMemory, nullptr);
+        vkDestroyBuffer(device, vertexBuffer, nullptr);
+        printlog("failed to create vertex buffer: vertex buffer memory allocation failed");
+        return result;
+    }
+    
+    // copy staging buffer to vertex buffer using GPU commands,
+    // then free the staging buffer and its memory.
+    copyBuffer(device, stagingBuffer, vertexBuffer, bufferSize);
+    vkDestroyBuffer(device, stagingBuffer, nullptr);
+    vkFreeMemory(device, stagingBufferMemory, nullptr);
+    
+    result.buffer = vertexBuffer;
+    result.memory = vertexBufferMemory;
+    return result;
+}
+
+Buffer createIndexBuffer(VkPhysicalDevice physicalDevice, VkDevice device, const QueueFamilies& families, const std::vector<uint16_t>& indices) {
+    Buffer result{};
+    VkDeviceSize bufferSize = sizeof(indices[0]) * indices.size();
+
+    // create staging buffer
+    auto stagingBuffer = createBuffer(device, families, bufferSize,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    if (!stagingBuffer) {
+        printlog("failed to create index buffer: staging buffer creation failed");
+        return result;
+    }
+    
+    // allocate staging buffer
+    auto stagingBufferMemory = allocateBufferMemory(physicalDevice, device, stagingBuffer,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (!stagingBufferMemory) {
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        printlog("failed to create index buffer: staging buffer memory allocation failed");
+        return result;
+    }
+
+    // map staging buffer (move data from CPU to staging buffer)
+    void* data;
+    vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);
+    memcpy(data, indices.data(), (size_t)bufferSize);
+    vkUnmapMemory(device, stagingBufferMemory);
+
+    // create vertex buffer
+    auto indexBuffer = createBuffer(device, families, bufferSize,
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    if (!indexBuffer) {
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingBufferMemory, nullptr);
+        printlog("failed to create index buffer: index buffer creation failed");
+        return result;
+    }
+    
+    // allocate vertex buffer memory
+    auto indexBufferMemory = allocateBufferMemory(physicalDevice, device, indexBuffer,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (!indexBufferMemory) {
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingBufferMemory, nullptr);
+        vkDestroyBuffer(device, indexBuffer, nullptr);
+        printlog("failed to create index buffer: index buffer memory allocation failed");
+        return result;
+    }
+    
+    // copy staging buffer to vertex buffer using GPU commands,
+    // then free the staging buffer and its memory.
+    copyBuffer(device, stagingBuffer, indexBuffer, bufferSize);
+    vkDestroyBuffer(device, stagingBuffer, nullptr);
+    vkFreeMemory(device, stagingBufferMemory, nullptr);
+    
+    result.buffer = indexBuffer;
+    result.memory = indexBufferMemory;
+    return result;
 }
 
 static bool createCommandBuffers(VkDevice device, CommandPool& commandPool) {
@@ -1028,6 +1482,7 @@ static bool recordCommandBuffer(VkCommandBuffer commandBuffer, VkRenderPass rend
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     
     // viewport and scissor were declared dynamic on the pipeline previously, so they must be recorded on the command line
+    // note: is there any performance advantage to making viewport and scissor static? answer: no, not really.
     
     VkViewport viewport{};
     viewport.x = 0.0f;
@@ -1043,17 +1498,22 @@ static bool recordCommandBuffer(VkCommandBuffer commandBuffer, VkRenderPass rend
     scissor.extent = extent;
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
-    // bind vertex buffer
-    VkBuffer vertexBuffers[] = {vk::vertexBuffer};
+    // bind mesh data
+    VkBuffer vertexBuffers[] = {vk::mesh.vertexBuffer.buffer};
     VkDeviceSize offsets[] = {0};
     vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
+    vkCmdBindIndexBuffer(commandBuffer, vk::mesh.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT16);
     
-    // draw call has 4 parameters (aside from the command buffer)
-    // * vertexCount: self explanatory
+    // bind descriptor set for uniforms
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk::pipelineLayout, 0, 1, &vk::descriptorPool.sets[vk::currentFrame], 0, nullptr);
+    
+    // draw call has 5 parameters (aside from the command buffer)
+    // * indexCount: self explanatory
     // * instanceCount: Used for instanced rendering, use 1 if you're not doing that.
-    // * firstVertex: Used as an offset into the vertex buffer, defines the lowest value of gl_VertexIndex.
+    // * firstIndex: Used as an offset into the index buffer.
+    // * vertexOffset: the values in the index buffer will be offset by this value.
     // * firstInstance: Used as an offset for instanced rendering, defines the lowest value of gl_InstanceIndex.
-    vkCmdDraw(commandBuffer, (uint32_t)app::vertices.size(), 1, 0, 0);
+    vkCmdDrawIndexed(commandBuffer, (uint32_t)app::indices.size(), 1, 0, 0, 0);
     
     // end render pass
     vkCmdEndRenderPass(commandBuffer);
@@ -1089,127 +1549,6 @@ static bool createSyncObjects() {
             return false;
         }
     }
-    return true;
-}
-
-static bool initVulkan(GLFWwindow* window) {
-    // initialize vulkan instance
-    vk::instance = createVulkanInstance();
-    if (vk::instance == VK_NULL_HANDLE) {
-        return false;
-    }
-    
-    // get surface from window
-    vk::surface = createVulkanSurface(vk::instance, window);
-    if (vk::surface == nullptr) {
-        return false;
-    }
-    
-    // create physical rendering device and create logical device
-    vk::physicalDevice = pickPhysicalDevice(vk::instance, vk::surface);
-    if (vk::physicalDevice == VK_NULL_HANDLE) {
-        return false;
-    }
-    vk::families = findQueueFamilies(vk::physicalDevice, vk::surface);
-    printlog("%u queue families found:", (uint32_t)vk::families.size());
-    for (auto& family : vk::families) {
-        if (family.hasGraphics && family.hasPresent) {
-            printlog(" (%u) queues = %u, %s, %s",
-                family.index, family.queues,
-                "has graphics", "has present");
-        }
-        else if (family.hasGraphics || family.hasPresent) {
-            printlog(" (%u) queues = %u, %s", family.index, family.queues,
-                family.hasGraphics ? "has graphics" : "has present");
-        }
-        else {
-            printlog(" (%u) queues = %u", family.index, family.queues);
-        }
-    }
-    vk::device = createLogicalVulkanDevice(vk::families, vk::physicalDevice, vk::surface);
-    if (vk::device == VK_NULL_HANDLE) {
-        return false;
-    }
-    
-    // create swap chain and image views
-    vk::swapChain = createSwapChain(vk::swapChain, vk::window, vk::physicalDevice, vk::device, vk::surface, vk::families);
-    if (vk::swapChain == VK_NULL_HANDLE) {
-        return false;
-    }
-    if (!createImageViews(vk::device, vk::swapChain)) {
-        return false;
-    }
-    
-    // create render pass and pipeline
-    vk::renderPass = createRenderPass(vk::device, vk::swapChainFormat);
-    if (vk::renderPass == VK_NULL_HANDLE) {
-        return false;
-    }
-    vk::pipeline = createGraphicsPipeline(vk::device, vk::swapChainExtent, vk::renderPass);
-    if (vk::pipeline == VK_NULL_HANDLE) {
-        return false;
-    }
-    
-    // create framebuffer
-    const bool framebufferCreationResult = createFramebuffers(
-        vk::device,
-        vk::swapChainFramebuffers,
-        vk::swapChainImageViews,
-        vk::renderPass,
-        vk::swapChainExtent);
-    if (!framebufferCreationResult) {
-        return false;
-    }
-    
-    // create vertex buffer
-    vk::vertexBuffer = createVertexBuffer(vk::device, sizeof(app::vertices[0]) * app::vertices.size());
-    if (vk::vertexBuffer == VK_NULL_HANDLE) {
-        return false;
-    }
-    vk::vertexBufferMemory = allocateVertexBufferMemory(vk::physicalDevice, vk::device, vk::vertexBuffer);
-    if (vk::vertexBufferMemory == VK_NULL_HANDLE) {
-        return false;
-    }
-    copyVertexDataToVertexBufferMemory(vk::device, vk::vertexBufferMemory, app::vertices);
-    
-    // create command pools/buffers
-    for (int index = 0; index < vk::families.size(); ++index) {
-        auto commandPoolHandle = createCommandPool(vk::device, index);
-        if (commandPoolHandle) {
-            CommandPool commandPool{commandPoolHandle};
-            if (createCommandBuffers(vk::device, commandPool)) {
-                vk::commandPools.push_back(commandPool);
-            } else {
-                return false; // something went wrong
-            }
-        } else {
-            return false; // something went wrong
-        }
-    }
-    
-    // create semaphores and fences
-    if (!createSyncObjects()) {
-        return false;
-    }
-    
-    return true;
-}
-
-static bool init() {
-    printlog("hello");
-    app::ticks = 0;
-    
-    (void)glslang_initialize_process();
-    
-    if ((vk::window = initGlfw()) == nullptr) {
-        return false;
-    }
-    
-    if (!initVulkan(vk::window)) {
-        return false;
-    }
-    
-    // success
     return true;
 }
 
@@ -1256,7 +1595,8 @@ static bool recreateSwapChain() {
     if (vk::renderPass == VK_NULL_HANDLE) {
         return false;
     }
-    vk::pipeline = createGraphicsPipeline(vk::device, vk::swapChainExtent, vk::renderPass);
+    const std::vector<VkDescriptorSetLayout> layouts = {vk::descriptorSetLayout};
+    vk::pipeline = createGraphicsPipeline(vk::device, layouts, vk::swapChainExtent, vk::renderPass);
     if (vk::pipeline == VK_NULL_HANDLE) {
         return false;
     }
@@ -1272,21 +1612,145 @@ static bool recreateSwapChain() {
     return true;
 }
 
+static bool initVulkan(GLFWwindow* window) {
+    // initialize vulkan instance
+    vk::instance = createVulkanInstance();
+    if (vk::instance == VK_NULL_HANDLE) {
+        return false;
+    }
+    
+    // get surface from window
+    vk::surface = createVulkanSurface(vk::instance, window);
+    if (vk::surface == nullptr) {
+        return false;
+    }
+    
+    // create physical rendering device and create logical device
+    vk::physicalDevice = pickPhysicalDevice(vk::instance, vk::surface);
+    if (vk::physicalDevice == VK_NULL_HANDLE) {
+        return false;
+    }
+    vk::families = findQueueFamilies(vk::physicalDevice, vk::surface);
+    printlog("%u queue families found:", (uint32_t)vk::families.size());
+    for (auto& family : vk::families) {
+        if (family.hasGraphics && family.hasPresent) {
+            printlog(" (%u) queues = %u, %s, %s",
+                family.index, family.queues,
+                "has graphics", "has present");
+        }
+        else if (family.hasGraphics || family.hasPresent) {
+            printlog(" (%u) queues = %u, %s", family.index, family.queues,
+                family.hasGraphics ? "has graphics" : "has present");
+        }
+        else {
+            printlog(" (%u) queues = %u", family.index, family.queues);
+        }
+    }
+    vk::device = createLogicalVulkanDevice(vk::families, vk::physicalDevice, vk::surface);
+    if (vk::device == VK_NULL_HANDLE) {
+        return false;
+    }
+    
+    // create uniform buffers (one needed for each frame in flight)
+    vk::uniformBuffers.resize(vk::maxImagesInFlight);
+    for (auto& buffer : vk::uniformBuffers) {
+        buffer = createUniformBuffer(vk::device, vk::physicalDevice, vk::families);
+        if (buffer.data == nullptr) {
+            return false;
+        }
+    }
+    
+    // create descriptor sets (used to bind shader uniforms to pipeline)
+    vk::descriptorSetLayout = createDescriptorSetLayout(vk::device);
+    if (vk::descriptorSetLayout == VK_NULL_HANDLE) {
+        return false;
+    }
+    vk::descriptorPool = createDescriptorPool(vk::device, vk::descriptorSetLayout, vk::uniformBuffers);
+    if (vk::descriptorPool.pool == VK_NULL_HANDLE) {
+        return false;
+    }
+    
+    // create swap chain, image views, render pass, pipeline, and framebuffer
+    if (!recreateSwapChain()) {
+        return false;
+    }
+    
+    // create command pools/buffers
+    for (int index = 0; index < vk::families.size(); ++index) {
+        auto commandPoolHandle = createCommandPool(vk::device, index);
+        if (commandPoolHandle) {
+            CommandPool commandPool{commandPoolHandle};
+            if (createCommandBuffers(vk::device, commandPool)) {
+                vk::commandPools.push_back(commandPool);
+            } else {
+                return false; // something went wrong
+            }
+        } else {
+            return false; // something went wrong
+        }
+    }
+    
+    // create mesh buffers
+    vk::mesh.vertexBuffer = createVertexBuffer(vk::physicalDevice, vk::device, vk::families, app::vertices);
+    if (vk::mesh.vertexBuffer.buffer == VK_NULL_HANDLE) {
+        return false;
+    }
+    vk::mesh.indexBuffer = createIndexBuffer(vk::physicalDevice, vk::device, vk::families, app::indices);
+    if (vk::mesh.indexBuffer.buffer == VK_NULL_HANDLE) {
+        return false;
+    }
+    
+    // create semaphores and fences
+    if (!createSyncObjects()) {
+        return false;
+    }
+    
+    return true;
+}
+
+static bool init() {
+    printlog("hello");
+    app::ticks = 0;
+    
+    (void)glslang_initialize_process();
+    
+    if ((vk::window = initGlfw()) == nullptr) {
+        return false;
+    }
+    
+    if (!initVulkan(vk::window)) {
+        return false;
+    }
+    
+    // success
+    return true;
+}
+
 static void cleanupVulkan() {
     if (vk::device) {
         vkDeviceWaitIdle(vk::device);
     }
     cleanupSwapChain();
     
-    // destroy vertex buffer
-    if (vk::vertexBuffer) {
-        vkDestroyBuffer(vk::device, vk::vertexBuffer, nullptr);
-        vk::vertexBuffer = VK_NULL_HANDLE;
+    // destroy uniform buffers
+    if (!vk::uniformBuffers.empty()) {
+        for (auto& buffer : vk::uniformBuffers) {
+            buffer.destroy(vk::device);
+        }
+        vk::uniformBuffers.clear();
     }
-    if (vk::vertexBufferMemory) {
-        vkFreeMemory(vk::device, vk::vertexBufferMemory, nullptr);
-        vk::vertexBufferMemory = VK_NULL_HANDLE;
+    
+    // destroy descriptor sets
+    if (vk::descriptorPool.pool != VK_NULL_HANDLE) {
+        vk::descriptorPool.destroy(vk::device);
     }
+    if (vk::descriptorSetLayout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(vk::device, vk::descriptorSetLayout, nullptr);
+        vk::descriptorSetLayout = VK_NULL_HANDLE;
+    }
+    
+    // destroy mesh
+    vk::mesh.destroy(vk::device);
     
     // destroy semaphores and fences
     for (int c = 0; c < vk::maxImagesInFlight; ++c) {
@@ -1367,23 +1831,36 @@ static void events() {
 constexpr int frames_per_second = 60;
 constexpr int max_frames_before_drop = 8;
 static int timer() {
-    int frames_to_do = 0;
-    static double last = 0.0;
+    static auto last = std::chrono::high_resolution_clock::now();
     static double diff = 0.0;
-    const double frame = (double)CLOCKS_PER_SEC / (double)frames_per_second;
-    const double now = clock();
-    diff += now - last;
+    constexpr auto frame = (double)1.0 / frames_per_second;
+    const auto now = std::chrono::high_resolution_clock::now();
+    diff += std::chrono::duration<double, std::chrono::seconds::period>(now - last).count();
+    int result = 0;
     while (diff >= frame) {
         diff -= frame;
-        if (frames_to_do < max_frames_before_drop) {
-            ++frames_to_do;
+        if (result < max_frames_before_drop) {
+            ++result;
         }
     }
-    last = clock();
-    return frames_to_do;
+    last = std::chrono::high_resolution_clock::now();
+    return result;
 }
 
 static void update(float seconds) {
+    // advance simulation time
+    //app::time += seconds;
+
+    app::ubo.model = glm::rotate(glm::mat4(1.0f), (float)app::time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+    app::ubo.view = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+    app::ubo.proj = glm::perspective(glm::radians(45.0f), vk::swapChainExtent.width / (float) vk::swapChainExtent.height, 0.1f, 10.0f);
+    
+    // in GL +Y = Up but in Vulkan +Y = Down.
+    // This flips the projection matrix so the image appears rightside up.
+    app::ubo.proj[0][0] *= (double)-1.0;
+    app::ubo.proj[1][1] *= (double)-1.0;
+
+    // advance simulation tick counter
     ++app::ticks;
 }
 
@@ -1420,6 +1897,9 @@ static int draw() {
     
     vkResetCommandBuffer(commandBuffer, 0);
     recordCommandBuffer(commandBuffer, vk::renderPass, vk::swapChainFramebuffers[imageIndex], vk::swapChainExtent, vk::pipeline);
+    
+    // update mapped uniform buffer with simulation data
+    memcpy(vk::uniformBuffers[vk::currentFrame].data, &app::ubo, sizeof(app::ubo));
     
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -1480,7 +1960,7 @@ static bool swap(uint32_t imageIndex) {
     default: printlog("failed to submit command buffer to present queue!"); return false;
     }
     
-    if (vk::framebufferResized) {
+    if (vk::windowResized) {
         recreateSwapChain();
     }
     
@@ -1489,15 +1969,58 @@ static bool swap(uint32_t imageIndex) {
     return true;
 }
 
+// lifted from https://blat-blatnik.github.io/computerBear/making-accurate-sleep-function/
+void preciseSleep(double seconds) {
+    using namespace std;
+    using namespace chrono;
+
+    static double estimate = 5e-3;
+    static double mean = 5e-3;
+    static double m2 = 0;
+    static int64_t count = 1;
+
+    while (seconds > estimate) {
+        auto start = high_resolution_clock::now();
+        this_thread::sleep_for(milliseconds(1));
+        auto end = high_resolution_clock::now();
+
+        double observed = (end - start).count() / 1e9;
+        seconds -= observed;
+
+        ++count;
+        double delta = observed - mean;
+        mean += delta / count;
+        m2   += delta * (observed - mean);
+        double stddev = sqrt(m2 / (count - 1));
+        estimate = mean + stddev;
+    }
+
+    // spin lock
+    auto start = high_resolution_clock::now();
+    while ((high_resolution_clock::now() - start).count() / 1e9 < seconds);
+}
+
 int main(int argc, const char* argv[]) {
     app::running = init();
+    
+    // mark start time
+    const auto appStart = std::chrono::high_resolution_clock::now();
     while (app::running) {
+        const auto frameStart = std::chrono::high_resolution_clock::now();
+        
+        // check app events (keyboard, window)
         events();
+        
+        // update simulation
         auto timer_update = timer();
         for (int c = 0; c < timer_update; ++c) {
             update(1.f / frames_per_second);
         }
+        
+        // draw
         const int drawImageIndex = draw();
+        
+        // swap
         if (drawImageIndex >= 0) {
             if (!swap(drawImageIndex)) {
                 printlog("present failed, aborting");
@@ -1507,6 +2030,22 @@ int main(int argc, const char* argv[]) {
             printlog("draw failed, aborting");
             app::running = false; // failed to draw
         }
+        
+        // sleep until next frame
+        const auto frameEnd = std::chrono::high_resolution_clock::now();
+        const auto frameTime = std::chrono::duration<double, std::chrono::seconds::period>(frameEnd - frameStart).count();
+        constexpr auto frameDuration = (double)1.0 / frames_per_second;
+        if (frameTime < frameDuration) {
+            preciseSleep(frameDuration - frameTime);
+        }
     }
+    
+    // count frames per second
+    const auto appEnd = std::chrono::high_resolution_clock::now();
+    const int frames = (int)app::ticks;
+    const auto seconds = std::chrono::duration<double, std::chrono::seconds::period>(appEnd - appStart).count();
+    const double fps = frames / seconds;
+    printlog("%.2f frames per second (%d frames / %.2f seconds)", fps, frames, seconds);
+    
     return term();
 }
