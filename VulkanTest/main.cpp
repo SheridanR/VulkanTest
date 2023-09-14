@@ -73,8 +73,9 @@ struct CommandPool {
 };
     
 struct Vertex {
-    glm::vec4 position;
-    glm::vec4 color;
+    alignas(16) glm::vec4 position;
+    alignas(16) glm::vec4 color;
+    alignas(8) glm::vec2 texCoord;
 
     static VkVertexInputBindingDescription getBindingDescription() {
         VkVertexInputBindingDescription bindingDescription{};
@@ -85,8 +86,8 @@ struct Vertex {
         return bindingDescription;
     }
     
-    static std::array<VkVertexInputAttributeDescription, 2> getAttributeDescriptions() {
-        std::array<VkVertexInputAttributeDescription, 2> attributeDescriptions{};
+    static std::array<VkVertexInputAttributeDescription, 3> getAttributeDescriptions() {
+        std::array<VkVertexInputAttributeDescription, 3> attributeDescriptions{};
         attributeDescriptions[0].binding = 0;
         attributeDescriptions[0].location = 0;
         attributeDescriptions[0].format = VK_FORMAT_R32G32B32A32_SFLOAT;
@@ -96,6 +97,11 @@ struct Vertex {
         attributeDescriptions[1].location = 1;
         attributeDescriptions[1].format = VK_FORMAT_R32G32B32A32_SFLOAT;
         attributeDescriptions[1].offset = offsetof(Vertex, color);
+        
+        attributeDescriptions[2].binding = 0;
+        attributeDescriptions[2].location = 2;
+        attributeDescriptions[2].format = VK_FORMAT_R32G32_SFLOAT;
+        attributeDescriptions[2].offset = offsetof(Vertex, texCoord);
 
         return attributeDescriptions;
     }
@@ -135,6 +141,19 @@ struct Image {
             vkFreeMemory(device, memory, nullptr);
             memory = VK_NULL_HANDLE;
         }
+    }
+};
+
+struct Texture {
+    Image image{};
+    VkSampler sampler{};
+    
+    void destroy(VkDevice device) {
+        if (sampler) {
+            vkDestroySampler(device, sampler, nullptr);
+            sampler = VK_NULL_HANDLE;
+        }
+        image.destroy(device);
     }
 };
 
@@ -185,7 +204,10 @@ struct DescriptorPool {
 const char glsl_vert[] = 
     "layout(location = 0) in vec4 inPosition;"
     "layout(location = 1) in vec4 inColor;"
+    "layout(location = 2) in vec2 inTexCoord;"
+    
     "layout(location = 0) out vec4 outColor;"
+    "layout(location = 1) out vec2 outTexCoord;"
     
     "layout(binding = 0) uniform UniformBufferObject {"
     "    mat4 proj;"
@@ -196,13 +218,19 @@ const char glsl_vert[] =
     "void main() {"
     "    gl_Position = ubo.proj * ubo.view * ubo.model * inPosition;"
     "    outColor = inColor;"
+    "    outTexCoord = inTexCoord;"
     "}";
 
 const char glsl_frag[] = 
     "layout(location = 0) in vec4 inColor;"
+    "layout(location = 1) in vec2 inTexCoord;"
+    
     "layout(location = 0) out vec4 outColor;"
+    
+    "layout(binding = 1) uniform sampler2D texSampler;"
+    
     "void main() {"
-    "    outColor = inColor;"
+    "    outColor = vec4(texture(texSampler, inTexCoord).rgb * inColor.rgb, 1.0);"
     "}";
 
 namespace app {
@@ -218,34 +246,42 @@ namespace app {
         {
             {-0.5f, -0.5f, -0.5f,  1.0f},
             { 0.0f,  0.0f,  0.0f,  1.0f},
+            { 0.0f,  0.0f },
         },
         {
             { 0.5f, -0.5f, -0.5f,  1.0f},
             { 1.0f,  0.0f,  0.0f,  1.0f},
+            { 1.0f,  0.0f },
         },
         {
             { 0.5f,  0.5f, -0.5f,  1.0f},
             { 1.0f,  1.0f,  0.0f,  1.0f},
+            { 1.0f,  1.0f },
         },
         {
             {-0.5f,  0.5f, -0.5f,  1.0f},
             { 0.0f,  1.0f,  0.0f,  1.0f},
+            { 0.0f,  1.0f },
         },
         {
             {-0.5f, -0.5f,  0.5f,  1.0f},
             { 0.0f,  0.0f,  1.0f,  1.0f},
+            { 0.0f,  0.0f },
         },
         {
             { 0.5f, -0.5f,  0.5f,  1.0f},
             { 1.0f,  0.0f,  1.0f,  1.0f},
+            { 1.0f,  0.0f },
         },
         {
             { 0.5f,  0.5f,  0.5f,  1.0f},
             { 1.0f,  1.0f,  1.0f,  1.0f},
+            { 1.0f,  1.0f },
         },
         {
             {-0.5f,  0.5f,  0.5f,  1.0f},
             { 0.0f,  1.0f,  1.0f,  1.0f},
+            { 0.0f,  1.0f },
         },
     };
     static const std::vector<uint16_t> indices = {
@@ -273,6 +309,7 @@ namespace vk {
     static GLFWwindow* window{};                                    // handle to the window in the window manager (desktop)
     static VkInstance instance{};                                   // handle to the vulkan instance (mother of it all)
     static VkPhysicalDevice physicalDevice{};                       // handle to physical device we want to use
+    static VkPhysicalDeviceProperties physicalDeviceProperties{};   // properties of the physical device we've chosen for rendering
     static VkDevice device{};                                       // handle to the logical device that does anything (GPU components we want to use)
     static VkSurfaceKHR surface{};                                  // the visible pixel data in the window, essentially
     
@@ -336,7 +373,7 @@ namespace vk {
     
     // test data
     static Mesh mesh{};
-    static Image texture{};
+    static Texture texture{};
     
     static std::vector<UniformBuffer> uniformBuffers{}; // uniform buffers; one buffer is needed for each frame in flight
     static DescriptorPool descriptorPool{}; // descriptor pools contain sets. sets declare uniform bindings in a pipeline
@@ -680,7 +717,7 @@ static VkPhysicalDevice pickPhysicalDevice(VkInstance instance, VkSurfaceKHR sur
     }
 }
 
-static VkDevice createLogicalVulkanDevice(QueueFamilies& families, VkPhysicalDevice device, VkSurfaceKHR surface) {
+static VkDevice createLogicalDevice(QueueFamilies& families, VkPhysicalDevice device, VkSurfaceKHR surface) {
     VkDevice result = VK_NULL_HANDLE;
     
     // create new queues for our logical device
@@ -704,6 +741,7 @@ static VkDevice createLogicalVulkanDevice(QueueFamilies& families, VkPhysicalDev
     
     // logical device features
     VkPhysicalDeviceFeatures deviceFeatures{};
+    deviceFeatures.samplerAnisotropy = VK_TRUE;
     
     // logical device extensions
     std::vector<const char*> requiredExtensions{
@@ -902,13 +940,21 @@ static VkDescriptorSetLayout createDescriptorSetLayout(VkDevice device) {
     uboLayoutBinding.binding = 0;
     uboLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     uboLayoutBinding.descriptorCount = 1;
-    uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT; // uniform layout is for the vertex shader
+    uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     uboLayoutBinding.pImmutableSamplers = nullptr;
     
+    VkDescriptorSetLayoutBinding samplerLayoutBinding{};
+    samplerLayoutBinding.binding = 1;
+    samplerLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    samplerLayoutBinding.descriptorCount = 1;
+    samplerLayoutBinding.pImmutableSamplers = nullptr;
+    samplerLayoutBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    std::array<VkDescriptorSetLayoutBinding, 2> bindings = {uboLayoutBinding, samplerLayoutBinding};
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 1;
-    layoutInfo.pBindings = &uboLayoutBinding;
+    layoutInfo.bindingCount = (uint32_t)bindings.size();
+    layoutInfo.pBindings = bindings.data();
 
     VkDescriptorSetLayout descriptorSetLayout;
     if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &descriptorSetLayout) != VK_SUCCESS) {
@@ -1171,22 +1217,24 @@ static bool createFramebuffers(
     return true;
 }
 
-DescriptorPool createDescriptorPool(VkDevice device, VkDescriptorSetLayout layout, const std::vector<UniformBuffer>& uniformBuffers) {
+DescriptorPool createDescriptorPool(VkDevice device, VkDescriptorSetLayout layout, const std::vector<UniformBuffer>& uniformBuffers, const Texture& texture) {
     DescriptorPool result{};
     
     const auto numDescriptorSets = (uint32_t)uniformBuffers.size();
     assert(numDescriptorSets != 0);
     
     // first step is to create the descriptor pool:
-
-    VkDescriptorPoolSize poolSize{};
-    poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    poolSize.descriptorCount = numDescriptorSets;
+    
+    std::array<VkDescriptorPoolSize, 2> poolSizes{};
+    poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    poolSizes[0].descriptorCount = numDescriptorSets;
+    poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    poolSizes[1].descriptorCount = numDescriptorSets;
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolInfo.poolSizeCount = 1;
-    poolInfo.pPoolSizes = &poolSize;
+    poolInfo.poolSizeCount = (uint32_t)poolSizes.size();
+    poolInfo.pPoolSizes = poolSizes.data();
     poolInfo.maxSets = numDescriptorSets;
     
     VkDescriptorPool descriptorPool;
@@ -1219,18 +1267,30 @@ DescriptorPool createDescriptorPool(VkDevice device, VkDescriptorSetLayout layou
         bufferInfo.offset = 0;
         bufferInfo.range = sizeof(UniformBufferObject);
         
-        VkWriteDescriptorSet descriptorWrite{};
-        descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        descriptorWrite.dstSet = result.sets[c];
-        descriptorWrite.dstBinding = 0;
-        descriptorWrite.dstArrayElement = 0;
-        descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        descriptorWrite.descriptorCount = 1;
-        descriptorWrite.pBufferInfo = &bufferInfo;
-        descriptorWrite.pImageInfo = nullptr; // Optional
-        descriptorWrite.pTexelBufferView = nullptr; // Optional
+        VkDescriptorImageInfo imageInfo{};
+        imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        imageInfo.imageView = texture.image.view;
+        imageInfo.sampler = texture.sampler;
         
-        vkUpdateDescriptorSets(device, 1, &descriptorWrite, 0, nullptr);
+        std::array<VkWriteDescriptorSet, 2> descriptorWrites{};
+        
+        descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        descriptorWrites[0].dstSet = result.sets[c];
+        descriptorWrites[0].dstBinding = 0;
+        descriptorWrites[0].dstArrayElement = 0;
+        descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        descriptorWrites[0].descriptorCount = 1;
+        descriptorWrites[0].pBufferInfo = &bufferInfo;
+        
+        descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        descriptorWrites[1].dstSet = result.sets[c];
+        descriptorWrites[1].dstBinding = 1;
+        descriptorWrites[1].dstArrayElement = 0;
+        descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        descriptorWrites[1].descriptorCount = 1;
+        descriptorWrites[1].pImageInfo = &imageInfo;
+        
+        vkUpdateDescriptorSets(device, (uint32_t)descriptorWrites.size(), descriptorWrites.data(), 0, nullptr);
     }
     
     result.pool = descriptorPool;
@@ -1389,10 +1449,10 @@ static bool transitionImageLayout(VkImage image, VkFormat format, VkImageLayout 
     barrier.subresourceRange.levelCount = 1;
     barrier.subresourceRange.baseArrayLayer = 0;
     barrier.subresourceRange.layerCount = 1;
-    barrier.srcAccessMask = 0;
-    barrier.dstAccessMask = 0;
     
-    // work out stage flags for the layout transition
+    // work out stages and access flags (valid combinations are as follows):
+    // https://registry.khronos.org/vulkan/specs/1.3-extensions/html/chap7.html#synchronization-access-types-supported
+    
     VkPipelineStageFlags sourceStage{};
     VkPipelineStageFlags destinationStage{};
     if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
@@ -1542,14 +1602,44 @@ Image createImage(
     return result;
 }
 
-Image createTexture(VkDevice device, VkPhysicalDevice physicalDevice, const QueueFamilies& families, const char* path) {
-    Image result{};
+static VkSampler createTextureSampler(VkDevice device) {
+    VkSamplerCreateInfo samplerInfo{};
+    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    samplerInfo.anisotropyEnable = vk::physicalDeviceProperties.limits.maxSamplerAnisotropy > 1.f ? VK_TRUE : VK_FALSE;
+    samplerInfo.maxAnisotropy = vk::physicalDeviceProperties.limits.maxSamplerAnisotropy;
+    samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+    samplerInfo.unnormalizedCoordinates = VK_FALSE;
+    samplerInfo.compareEnable = VK_FALSE;
+    samplerInfo.compareOp = VK_COMPARE_OP_ALWAYS;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    samplerInfo.mipLodBias = 0.0f;
+    samplerInfo.minLod = 0.0f;
+    samplerInfo.maxLod = 0.0f;
+    
+    VkSampler sampler{};
+    if (vkCreateSampler(device, &samplerInfo, nullptr, &sampler) != VK_SUCCESS) {
+        printlog("failed to create texture sampler!");
+        return VK_NULL_HANDLE;
+    }
+    
+    return sampler;
+}
+
+static Texture createTexture(VkDevice device, VkPhysicalDevice physicalDevice, const QueueFamilies& families, const char* path) {
+    assert(path);
+
+    Texture result{};
 
     int texWidth, texHeight, texChannels;
     auto pixels = stbi_load(path, &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
     VkDeviceSize bufferSize = texWidth * texHeight * texChannels;
     if (!pixels) {
-        printlog("failed to load texture image!");
+        printlog("failed to load texture from file '%s'", path);
         return result;
     }
     
@@ -1557,7 +1647,8 @@ Image createTexture(VkDevice device, VkPhysicalDevice physicalDevice, const Queu
     auto stagingBuffer = createBuffer(device, families, bufferSize,
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     if (!stagingBuffer) {
-        printlog("failed to create image: staging buffer creation failed");
+        stbi_image_free(pixels);
+        printlog("failed to create texture: staging buffer creation failed");
         return result;
     }
     
@@ -1565,8 +1656,9 @@ Image createTexture(VkDevice device, VkPhysicalDevice physicalDevice, const Queu
     auto stagingBufferMemory = allocateBufferMemory(physicalDevice, device, stagingBuffer,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     if (!stagingBufferMemory) {
+        stbi_image_free(pixels);
         vkDestroyBuffer(device, stagingBuffer, nullptr);
-        printlog("failed to create image: staging buffer memory allocation failed");
+        printlog("failed to create texture: staging buffer memory allocation failed");
         return result;
     }
 
@@ -1577,32 +1669,42 @@ Image createTexture(VkDevice device, VkPhysicalDevice physicalDevice, const Queu
     vkUnmapMemory(device, stagingBufferMemory);
     stbi_image_free(pixels);
     
-    result = createImage(device, physicalDevice, texWidth, texHeight, 1,
+    auto image = createImage(device, physicalDevice, texWidth, texHeight, 1,
         VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL,
         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (!result.image) {
+    if (!image.image) {
         vkDestroyBuffer(device, stagingBuffer, nullptr);
         vkFreeMemory(device, stagingBufferMemory, nullptr);
+        printlog("failed to create texture: image creation failed");
         return result;
     }
     
     // transition image to a layout suitable for copying
-    transitionImageLayout(result.image, VK_FORMAT_R8G8B8A8_SRGB,
+    transitionImageLayout(image.image, VK_FORMAT_R8G8B8A8_SRGB,
         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         
     // copy staging buffer contents to image
-    copyBufferToImage(stagingBuffer, result.image,
+    copyBufferToImage(stagingBuffer, image.image,
         (uint32_t)texWidth, (uint32_t)texHeight, 1);
     
     // transition image to a layout suitable for sampling
-    transitionImageLayout(result.image, VK_FORMAT_R8G8B8A8_SRGB,
+    transitionImageLayout(image.image, VK_FORMAT_R8G8B8A8_SRGB,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     
     // free the staging buffer and its memory.
     vkDestroyBuffer(device, stagingBuffer, nullptr);
     vkFreeMemory(device, stagingBufferMemory, nullptr);
     
+    auto sampler = createTextureSampler(device);
+    if (!sampler) {
+        printlog("failed to create texture: sampler creation failed");
+        image.destroy(device);
+        return result;
+    }
+    
+    result.image = image;
+    result.sampler = sampler;
     return result;
 }
 
@@ -1999,6 +2101,7 @@ static bool initVulkan(GLFWwindow* window) {
     if (vk::physicalDevice == VK_NULL_HANDLE) {
         return false;
     }
+    vkGetPhysicalDeviceProperties(vk::physicalDevice, &vk::physicalDeviceProperties);
     vk::families = findQueueFamilies(vk::physicalDevice, vk::surface);
     printlog("%u queue families found:", (uint32_t)vk::families.size());
     for (auto& family : vk::families) {
@@ -2015,7 +2118,7 @@ static bool initVulkan(GLFWwindow* window) {
             printlog(" (%u) queues = %u", family.index, family.queues);
         }
     }
-    vk::device = createLogicalVulkanDevice(vk::families, vk::physicalDevice, vk::surface);
+    vk::device = createLogicalDevice(vk::families, vk::physicalDevice, vk::surface);
     if (vk::device == VK_NULL_HANDLE) {
         return false;
     }
@@ -2027,21 +2130,6 @@ static bool initVulkan(GLFWwindow* window) {
         if (buffer.data == nullptr) {
             return false;
         }
-    }
-    
-    // create descriptor sets (used to bind shader uniforms to pipeline)
-    vk::descriptorSetLayout = createDescriptorSetLayout(vk::device);
-    if (vk::descriptorSetLayout == VK_NULL_HANDLE) {
-        return false;
-    }
-    vk::descriptorPool = createDescriptorPool(vk::device, vk::descriptorSetLayout, vk::uniformBuffers);
-    if (vk::descriptorPool.pool == VK_NULL_HANDLE) {
-        return false;
-    }
-    
-    // create swap chain, image views, render pass, pipeline, and framebuffer
-    if (!recreateSwapChain()) {
-        return false;
     }
     
     // create command pools/buffers
@@ -2062,6 +2150,21 @@ static bool initVulkan(GLFWwindow* window) {
     // load texture
     vk::texture = createTexture(vk::device, vk::physicalDevice, vk::families,
         "mesh/cube/cube.png");
+    
+    // create descriptor sets (used to bind shader uniforms to pipeline)
+    vk::descriptorSetLayout = createDescriptorSetLayout(vk::device);
+    if (vk::descriptorSetLayout == VK_NULL_HANDLE) {
+        return false;
+    }
+    vk::descriptorPool = createDescriptorPool(vk::device, vk::descriptorSetLayout, vk::uniformBuffers, vk::texture);
+    if (vk::descriptorPool.pool == VK_NULL_HANDLE) {
+        return false;
+    }
+    
+    // create swap chain, image views, render pass, pipeline, and framebuffer
+    if (!recreateSwapChain()) {
+        return false;
+    }
     
     // create mesh buffers
     vk::mesh.vertexBuffer = createVertexBuffer(vk::physicalDevice, vk::device, vk::families, app::vertices);
