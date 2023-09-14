@@ -13,6 +13,7 @@
 		84253C752A9AB1AB00AA250A /* libshaderc_combined.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 84253C742A9AB1AB00AA250A /* libshaderc_combined.a */; };
 		84253C762A9AB1BD00AA250A /* libglslang-default-resource-limits.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 84253C6F2A9AAF2500AA250A /* libglslang-default-resource-limits.a */; };
 		844A2F122AAAAFB90052049D /* mesh in Resources */ = {isa = PBXBuildFile; fileRef = 844A2F112AAAAFB90052049D /* mesh */; };
+		84AE905A2AB25A54009EE8FE /* stb in Resources */ = {isa = PBXBuildFile; fileRef = 84AE90592AB25A54009EE8FE /* stb */; };
 		84CC6AA62A9499AA0088E3E4 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 84CC6AA52A9499AA0088E3E4 /* Assets.xcassets */; };
 		84CC6AAE2A9499ED0088E3E4 /* main.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 841194A82A9422DD00820421 /* main.cpp */; };
 		84CC6AB22A949ACB0088E3E4 /* libglfw.3.3.dylib in Frameworks */ = {isa = PBXBuildFile; fileRef = 841194CC2A94633D00820421 /* libglfw.3.3.dylib */; };
@@ -52,6 +53,7 @@
 		84253C712A9AAF5400AA250A /* libspirv-cross-glsl.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = "libspirv-cross-glsl.a"; path = "../../../Library/VulkanSDK/1.3.250.1/macOS/lib/libspirv-cross-glsl.a"; sourceTree = "<group>"; };
 		84253C742A9AB1AB00AA250A /* libshaderc_combined.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libshaderc_combined.a; path = ../../../Library/VulkanSDK/1.3.250.1/macOS/lib/libshaderc_combined.a; sourceTree = "<group>"; };
 		844A2F112AAAAFB90052049D /* mesh */ = {isa = PBXFileReference; lastKnownFileType = folder; path = mesh; sourceTree = "<group>"; };
+		84AE90592AB25A54009EE8FE /* stb */ = {isa = PBXFileReference; lastKnownFileType = folder; path = stb; sourceTree = "<group>"; };
 		84CC6A9F2A9499A90088E3E4 /* VulkanTest.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = VulkanTest.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		84CC6AA52A9499AA0088E3E4 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		84CC6AB72A949B2F0088E3E4 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
@@ -95,6 +97,7 @@
 		841194A72A9422DD00820421 /* VulkanTest */ = {
 			isa = PBXGroup;
 			children = (
+				84AE90592AB25A54009EE8FE /* stb */,
 				844A2F112AAAAFB90052049D /* mesh */,
 				84253C5E2A99849800AA250A /* vulkan */,
 				84CC6AB72A949B2F0088E3E4 /* Info.plist */,
@@ -185,6 +188,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				84AE905A2AB25A54009EE8FE /* stb in Resources */,
 				84CC6AA62A9499AA0088E3E4 /* Assets.xcassets in Resources */,
 				84253C5F2A99849800AA250A /* vulkan in Resources */,
 				844A2F122AAAAFB90052049D /* mesh in Resources */,

@@ -17,10 +17,13 @@
 #include <GLFW/glfw3.h>
 
 #define GLM_FORCE_RADIANS
-#define GLM_FORCE_DEPTH_ZERO_TO_ONE
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE // required for vulkan
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtx/transform.hpp>
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb/stb_image.h"
 
 // C headers
 #include <string.h>
@@ -28,6 +31,7 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <assert.h>
+#include <unistd.h>
 
 // C++ headers
 #include <thread>
@@ -107,6 +111,27 @@ struct Buffer {
             buffer = VK_NULL_HANDLE;
         }
         if (memory != VK_NULL_HANDLE) {
+            vkFreeMemory(device, memory, nullptr);
+            memory = VK_NULL_HANDLE;
+        }
+    }
+};
+
+struct Image {
+    VkImage image{};
+    VkImageView view{};
+    VkDeviceMemory memory{};
+    
+    void destroy(VkDevice device) {
+        if (view) {
+            vkDestroyImageView(device, view, nullptr);
+            view = VK_NULL_HANDLE;
+        }
+        if (image) {
+            vkDestroyImage(device, image, nullptr);
+            image = VK_NULL_HANDLE;
+        }
+        if (memory) {
             vkFreeMemory(device, memory, nullptr);
             memory = VK_NULL_HANDLE;
         }
@@ -272,12 +297,13 @@ namespace vk {
     static VkFormat swapChainFormat{};                              // pixel format of the images in the swap chain
     static VkExtent2D swapChainExtent{};                            // dimensions of the images in the chain (matches the surface size essentially)
     static std::vector<VkImage> swapChainImages{};                  // pixel data for every image in the swap chain
-    static std::vector<VkImageView> swapChainImageViews{};          // interface to the swap chain images which framebuffers need (framebuffers are output of drawing commands)
+    static std::vector<VkImageView> swapChainImageViews{};          // interface to the swap chain images which framebuffers need
+    static std::vector<Image> depthBuffers{};                       // every image in the swapchain gets a depth buffer (unlike other swapchain images, the memory must be managed by us)
     
-    // framebuffers are very simple objects.
-    // all they do is define the output between a renderpass and one or more image views.
-    // if you want a renderpass to output to more than one image,
-    // configuring a framebuffer to have more than one attachment is the way to do it.
+    // framebuffers are very simple objects. they are the output of drawing commands.
+    // all they do is define the relationship between a renderpass and one or more image views.
+    // if you want a renderpass to output to more than one image, configuring a framebuffer
+    // to have more than one attachment is the way to do it.
     static std::vector<VkFramebuffer> swapChainFramebuffers{};
     
     static VkDescriptorSetLayout descriptorSetLayout{};             // defines uniform bindings between shader and pipeline layout
@@ -308,12 +334,79 @@ namespace vk {
     // * Multisampling requires a device that supports it and a render pass + pipeline that implements it
     // * Compute shaders, ray-tracing, video encoding/decoding, presentation, transferring, etc.
     
-    // vertex and index buffers for a mesh
+    // test data
     static Mesh mesh{};
+    static Image texture{};
     
-    static DescriptorPool descriptorPool{};               // descriptor pools contain descriptor sets, of which one is needed for each frame in flight
-    static std::vector<UniformBuffer> uniformBuffers{};     // uniform buffers; one buffer is needed for each frame in flight
+    static std::vector<UniformBuffer> uniformBuffers{}; // uniform buffers; one buffer is needed for each frame in flight
+    static DescriptorPool descriptorPool{}; // descriptor pools contain sets. sets declare uniform bindings in a pipeline
 };
+
+static bool getTransferQueue(VkQueue& queue, VkCommandBuffer& commandBuffer) {
+    // for now: pick the first capable queue to work with.
+    int familyIndex = 0;
+    queue = VK_NULL_HANDLE;
+    for (auto& family : vk::families) {
+        if (family.hasTransfer && family.queues > 0) {
+            vkGetDeviceQueue(vk::device, family.index, 0, &queue);
+            break;
+        }
+        ++familyIndex;
+    }
+    if (!queue) {
+        printlog("no suitable queue for transferring");
+        return false;
+    }
+    
+    // pick the command buffer associated with the command pool / queue family
+    assert(familyIndex < vk::commandPools.size());
+    commandBuffer = vk::commandPools[familyIndex].buffers[vk::currentFrame];
+    return true;
+}
+
+static bool getGraphicsQueue(VkQueue& queue, VkCommandBuffer& commandBuffer) {
+    // for now: pick the first capable queue to work with.
+    int familyIndex = 0;
+    queue = VK_NULL_HANDLE;
+    for (auto& family : vk::families) {
+        if (family.hasGraphics && family.queues > 0) {
+            vkGetDeviceQueue(vk::device, family.index, 0, &queue);
+            break;
+        }
+        ++familyIndex;
+    }
+    if (!queue) {
+        printlog("no suitable queue for transferring");
+        return false;
+    }
+    
+    // pick the command buffer associated with the command pool / queue family
+    assert(familyIndex < vk::commandPools.size());
+    commandBuffer = vk::commandPools[familyIndex].buffers[vk::currentFrame];
+    return true;
+}
+
+static bool getPresentQueue(VkQueue& queue, VkCommandBuffer& commandBuffer) {
+    // for now: pick the first capable queue to work with.
+    int familyIndex = 0;
+    queue = VK_NULL_HANDLE;
+    for (auto& family : vk::families) {
+        if (family.hasPresent && family.queues > 0) {
+            vkGetDeviceQueue(vk::device, family.index, 0, &queue);
+            break;
+        }
+        ++familyIndex;
+    }
+    if (!queue) {
+        printlog("no suitable queue for transferring");
+        return false;
+    }
+    
+    // pick the command buffer associated with the command pool / queue family
+    assert(familyIndex < vk::commandPools.size());
+    commandBuffer = vk::commandPools[familyIndex].buffers[vk::currentFrame];
+    return true;
+}
 
 QueueFamilies findQueueFamilies(VkPhysicalDevice device, VkSurfaceKHR surface) {
     QueueFamilies result;
@@ -727,29 +820,45 @@ static VkSwapchainKHR createSwapChain(VkSwapchainKHR oldSwapChain, GLFWwindow* w
     return swapChain;
 }
 
-static bool createImageViews(VkDevice device, VkSwapchainKHR swapChain) {
+static VkImageView createImageView(VkDevice device, VkImage image, VkImageViewType type, VkFormat format) {
+    assert(device);
+    assert(image);
+
+    VkImageViewCreateInfo createInfo{};
+    createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    createInfo.image = image;
+    createInfo.viewType = type;
+    createInfo.format = format;
+    createInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+    createInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+    createInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+    createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+    createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    createInfo.subresourceRange.baseMipLevel = 0;
+    createInfo.subresourceRange.levelCount = 1;
+    createInfo.subresourceRange.baseArrayLayer = 0;
+    createInfo.subresourceRange.layerCount = 1;
+    
+    VkImageView imageView{};
+    if (vkCreateImageView(device, &createInfo, nullptr, &imageView) != VK_SUCCESS) {
+        printlog("failed to create vulkan image view");
+        return VK_NULL_HANDLE;
+    }
+    
+    return imageView;
+}
+
+static bool createSwapChainImageViews(VkDevice device, VkSwapchainKHR swapChain) {
     uint32_t swapChainImageCount;
     vkGetSwapchainImagesKHR(device, swapChain, &swapChainImageCount, nullptr);
     vk::swapChainImages.resize(swapChainImageCount);
     vkGetSwapchainImagesKHR(device, swapChain, &swapChainImageCount, vk::swapChainImages.data());
     vk::swapChainImageViews.resize(swapChainImageCount);
     for (size_t i = 0; i < vk::swapChainImages.size(); i++) {
-        VkImageViewCreateInfo createInfo{};
-        createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        createInfo.image = vk::swapChainImages[i];
-        createInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        createInfo.format = vk::swapChainFormat;
-        createInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
-        createInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
-        createInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
-        createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
-        createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        createInfo.subresourceRange.baseMipLevel = 0;
-        createInfo.subresourceRange.levelCount = 1;
-        createInfo.subresourceRange.baseArrayLayer = 0;
-        createInfo.subresourceRange.layerCount = 1;
-        if (vkCreateImageView(vk::device, &createInfo, nullptr, &vk::swapChainImageViews[i]) != VK_SUCCESS) {
-            printlog("failed to create vulkan image view");
+        vk::swapChainImageViews[i] = createImageView(device, vk::swapChainImages[i],
+            VK_IMAGE_VIEW_TYPE_2D, vk::swapChainFormat);
+        if (!vk::swapChainImageViews[i]) {
+            printlog("failed to create image view for swap chain!");
             return false;
         }
     }
@@ -1002,8 +1111,8 @@ static VkRenderPass createRenderPass(VkDevice device, VkFormat format) {
     // this dependency prevents this render pass from executing until the
     // color attachment in the framebuffer has been freed from its last write.
     // TODO: study what subpasses are and why they really exist.
-    // They seem to have something to do with simply adjusting memory layout
-    // of an image for coherency with upcoming operations.
+    // Apparently certain implicit subpasses adjust memory layouts of inputs
+    // just to achieve coherency with upcoming operations.
     VkSubpassDependency dependency{};
     dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
     dependency.dstSubpass = 0;
@@ -1212,25 +1321,11 @@ static VkBuffer createBuffer(VkDevice device, const QueueFamilies& families, VkD
 }
 
 static bool copyBuffer(VkDevice device, VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size) {
-    // pick the first transfer capable queue to work with.
-    int familyIndex = 0;
+    VkCommandBuffer commandBuffer{};
     VkQueue transferQueue{};
-    for (auto& family : vk::families) {
-        if (family.hasTransfer && family.queues > 0) {
-            vkGetDeviceQueue(vk::device, family.index, 0, &transferQueue);
-            break;
-        }
-        ++familyIndex;
-    }
-    if (!transferQueue) {
-        printlog("no suitable queue for transferring");
-        return false;
-    }
+    getTransferQueue(transferQueue, commandBuffer);
     
-    // pick the command buffer associated with the command pool / queue family
-    assert(familyIndex < vk::commandPools.size());
-    auto& commandBuffer = vk::commandPools[familyIndex].buffers[vk::currentFrame];
-    
+    vkResetCommandBuffer(commandBuffer, 0);
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = 0; // if this were a temporary buffer we could use VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT. but its not
@@ -1243,14 +1338,13 @@ static bool copyBuffer(VkDevice device, VkBuffer srcBuffer, VkBuffer dstBuffer, 
     vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
     
     vkEndCommandBuffer(commandBuffer);
-    
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &commandBuffer;
-
-    // stall CPU until transfer completes.
     vkQueueSubmit(transferQueue, 1, &submitInfo, VK_NULL_HANDLE);
+    
+    // stall CPU until queue is finished
     vkQueueWaitIdle(transferQueue);
     
     // clearly stalling is not the only choice here.
@@ -1268,6 +1362,248 @@ static bool copyBuffer(VkDevice device, VkBuffer srcBuffer, VkBuffer dstBuffer, 
     // application.
     
     return true;
+}
+
+static bool transitionImageLayout(VkImage image, VkFormat format, VkImageLayout oldLayout, VkImageLayout newLayout) {
+    VkQueue queue{};
+    VkCommandBuffer commandBuffer{};
+    getTransferQueue(queue, commandBuffer);
+    
+    vkResetCommandBuffer(commandBuffer, 0);
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = 0; // if this were a temporary buffer we could use VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT. but its not
+    vkBeginCommandBuffer(commandBuffer, &beginInfo);
+    
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = oldLayout;
+    barrier.newLayout = newLayout;
+    
+    // if transferring an image to another queue family, use these:
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = 1;
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = 0;
+    
+    // work out stage flags for the layout transition
+    VkPipelineStageFlags sourceStage{};
+    VkPipelineStageFlags destinationStage{};
+    if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+        sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    } else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+        sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    } else {
+        printlog("unsupported layout transition!");
+    }
+    
+    // vkCmdPipelineBarrier transitions the memory layout of the image.
+    // The fourth parameter is either 0 or VK_DEPENDENCY_BY_REGION_BIT.
+    // The latter turns the barrier into a per-region condition.
+    // That means that the implementation is allowed to already begin
+    // reading from the parts of a resource that were written so far, for example.
+    vkCmdPipelineBarrier(commandBuffer,
+        sourceStage, destinationStage,
+        0,              // VK_DEPENDENCY_BY_REGION_BIT
+        0, nullptr,     // memory layout transfer
+        0, nullptr,     // buffer layout transfer
+        1, &barrier);   // image layout transfer
+    
+    vkEndCommandBuffer(commandBuffer);
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffer;
+    vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
+    
+    // stall CPU until queue is finished
+    // TODO: find a better way to synchronize this than stalling the queue
+    vkQueueWaitIdle(queue);
+    
+    return true;
+}
+
+static bool copyBufferToImage(VkBuffer buffer, VkImage image, uint32_t width, uint32_t height, uint32_t depth) {
+    VkQueue queue{};
+    VkCommandBuffer commandBuffer{};
+    getTransferQueue(queue, commandBuffer);
+    
+    vkResetCommandBuffer(commandBuffer, 0);
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = 0; // if this were a temporary buffer we could use VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT. but its not
+    vkBeginCommandBuffer(commandBuffer, &beginInfo);
+    
+    VkBufferImageCopy region{};
+    region.bufferOffset = 0;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageOffset = {0, 0, 0};
+    region.imageExtent = {width, height, depth};
+    vkCmdCopyBufferToImage(commandBuffer, buffer, image,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    
+    vkEndCommandBuffer(commandBuffer);
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffer;
+    vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
+    
+    // stall CPU until queue is finished
+    // TODO: find a better way to synchronize this than stalling the queue
+    vkQueueWaitIdle(queue);
+    
+    return true;
+}
+
+Image createImage(
+    VkDevice device,
+    VkPhysicalDevice physicalDevice,
+    uint32_t width, uint32_t height, uint32_t depth,
+    VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties
+) {
+    assert(device);
+    assert(physicalDevice);
+    assert(width);
+    assert(height);
+    assert(depth);
+
+    Image result{};
+    
+    VkImageCreateInfo imageInfo{};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.imageType = depth > 1 ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+    imageInfo.extent.width = width;
+    imageInfo.extent.height = height;
+    imageInfo.extent.depth = depth;
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.format = format;
+    imageInfo.tiling = tiling;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    imageInfo.usage = usage;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE; // used by one queue family (for graphics as well as transfers)
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.flags = 0; // Optional
+    
+    VkImage image;
+    if (vkCreateImage(device, &imageInfo, nullptr, &image) != VK_SUCCESS) {
+        printlog("failed to create image: image creation failed");
+        return result;
+    }
+    
+    VkMemoryRequirements memRequirements;
+    vkGetImageMemoryRequirements(device, image, &memRequirements);
+
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memRequirements.size;
+    allocInfo.memoryTypeIndex = findMemoryType(physicalDevice, memRequirements.memoryTypeBits, properties);
+
+    VkDeviceMemory imageMemory;
+    if (vkAllocateMemory(device, &allocInfo, nullptr, &imageMemory) != VK_SUCCESS) {
+        vkDestroyImage(device, image, nullptr);
+        printlog("failed to create image: image memory allocation failed");
+        return result;
+    }
+
+    vkBindImageMemory(device, image, imageMemory, 0);
+    
+    auto imageView = createImageView(device, image, depth > 1 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D, format);
+    if (!imageView) {
+        vkDestroyImage(device, image, nullptr);
+        vkFreeMemory(device, imageMemory, nullptr);
+        printlog("failed to create image: image view creation failed");
+        return result;
+    }
+    
+    result.image = image;
+    result.memory = imageMemory;
+    result.view = imageView;
+    return result;
+}
+
+Image createTexture(VkDevice device, VkPhysicalDevice physicalDevice, const QueueFamilies& families, const char* path) {
+    Image result{};
+
+    int texWidth, texHeight, texChannels;
+    auto pixels = stbi_load(path, &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
+    VkDeviceSize bufferSize = texWidth * texHeight * texChannels;
+    if (!pixels) {
+        printlog("failed to load texture image!");
+        return result;
+    }
+    
+    // create staging buffer
+    auto stagingBuffer = createBuffer(device, families, bufferSize,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    if (!stagingBuffer) {
+        printlog("failed to create image: staging buffer creation failed");
+        return result;
+    }
+    
+    // allocate staging buffer
+    auto stagingBufferMemory = allocateBufferMemory(physicalDevice, device, stagingBuffer,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (!stagingBufferMemory) {
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        printlog("failed to create image: staging buffer memory allocation failed");
+        return result;
+    }
+
+    // map staging buffer (move data from CPU to staging buffer)
+    void* data;
+    vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);
+    memcpy(data, pixels, (size_t)bufferSize);
+    vkUnmapMemory(device, stagingBufferMemory);
+    stbi_image_free(pixels);
+    
+    result = createImage(device, physicalDevice, texWidth, texHeight, 1,
+        VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL,
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (!result.image) {
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingBufferMemory, nullptr);
+        return result;
+    }
+    
+    // transition image to a layout suitable for copying
+    transitionImageLayout(result.image, VK_FORMAT_R8G8B8A8_SRGB,
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        
+    // copy staging buffer contents to image
+    copyBufferToImage(stagingBuffer, result.image,
+        (uint32_t)texWidth, (uint32_t)texHeight, 1);
+    
+    // transition image to a layout suitable for sampling
+    transitionImageLayout(result.image, VK_FORMAT_R8G8B8A8_SRGB,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    
+    // free the staging buffer and its memory.
+    vkDestroyBuffer(device, stagingBuffer, nullptr);
+    vkFreeMemory(device, stagingBufferMemory, nullptr);
+    
+    return result;
 }
 
 static UniformBuffer createUniformBuffer(VkDevice device, VkPhysicalDevice physicalDevice, const QueueFamilies& families) {
@@ -1449,12 +1785,45 @@ static VkCommandPool createCommandPool(VkDevice device, uint32_t queueFamilyInde
     return commandPool;
 }
 
+/*
+    All of the command buffers we've used thus far have been primary command buffers,
+meaning they can be submitted directly to a Vulkan queue to be executed by the device.
+Secondary command buffers are instead executed indirectly by being called from primary
+command buffers and may not be submitted to queues.
+
+The usage of secondary command buffers offers two primary advantages:
+
+    1. Secondary command buffers may be allocated and recorded in parallel
+    which allows you to better leverage modern hardware with its panoply of CPU cores
+
+    2. The lifetime of secondary command buffers can managed independently of one another
+    so you can have a mixture of long-lived or permanent secondary command buffers that
+    intermingle with frequently updated secondary command buffers which allows you to
+    reduce the number of command buffers you need to create every frame
+
+Both of these points are true for primary command buffers as well, but primary command
+buffers have a significant limitation that effectively prevents them from fulfilling
+these use cases. Multiple primary command buffers may not be executed within the same
+render pass instance meaning that if you wanted to execute multiple primary command
+buffers for a frame, each primary command buffer would need to start with
+cmd_begin_render_pass and end with cmd_end_render_pass.
+
+This might not sound like a big deal but beginning a render pass instance can be a pretty
+heavyweight operation and needing to do this many times per frame can destroy performance
+on some hardware. Secondary command buffers avoid this problem by being able to inherit
+the render pass instance as well as other state from the primary command buffer it is
+called from.
+
+    https://kylemayes.github.io/vulkanalia/dynamic/secondary_command_buffers.html#primary-vs-secondary
+*/
+
 static bool recordCommandBuffer(VkCommandBuffer commandBuffer, VkRenderPass renderPass, VkFramebuffer framebuffer, VkExtent2D extent, VkPipeline pipeline) {
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = 0; // see VkCommandBufferUsageFlags
     
-    // for secondary command buffers, allows us to specify what part of the command buffer to inherit:
+    // for secondary command buffers:
+    // allows us to specify what part of the command buffer to inherit
     beginInfo.pInheritanceInfo = nullptr;
     
     if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
@@ -1545,7 +1914,7 @@ static bool createSyncObjects() {
         if (vkCreateSemaphore(vk::device, &semaphoreInfo, nullptr, &vk::imageAvailableSemaphores[c]) != VK_SUCCESS ||
             vkCreateSemaphore(vk::device, &semaphoreInfo, nullptr, &vk::renderFinishedSemaphores[c]) != VK_SUCCESS ||
             vkCreateFence(vk::device, &fenceInfo, nullptr, &vk::inFlightFences[c]) != VK_SUCCESS) {
-            printlog("failed to create semaphores!");
+            printlog("failed to create sync objects!");
             return false;
         }
     }
@@ -1588,7 +1957,7 @@ static bool recreateSwapChain() {
     if (vk::swapChain == VK_NULL_HANDLE) {
         return false;
     }
-    if (!createImageViews(vk::device, vk::swapChain)) {
+    if (!createSwapChainImageViews(vk::device, vk::swapChain)) {
         return false;
     }
     vk::renderPass = createRenderPass(vk::device, vk::swapChainFormat);
@@ -1690,6 +2059,10 @@ static bool initVulkan(GLFWwindow* window) {
         }
     }
     
+    // load texture
+    vk::texture = createTexture(vk::device, vk::physicalDevice, vk::families,
+        "mesh/cube/cube.png");
+    
     // create mesh buffers
     vk::mesh.vertexBuffer = createVertexBuffer(vk::physicalDevice, vk::device, vk::families, app::vertices);
     if (vk::mesh.vertexBuffer.buffer == VK_NULL_HANDLE) {
@@ -1705,10 +2078,17 @@ static bool initVulkan(GLFWwindow* window) {
         return false;
     }
     
+    // just make sure any necessary buffer copy commands have finished.
+    vkDeviceWaitIdle(vk::device);
+    
     return true;
 }
 
 static bool init() {
+#ifdef __APPLE__
+    chdir("../Resources");
+#endif
+
     printlog("hello");
     app::ticks = 0;
     
@@ -1748,6 +2128,9 @@ static void cleanupVulkan() {
         vkDestroyDescriptorSetLayout(vk::device, vk::descriptorSetLayout, nullptr);
         vk::descriptorSetLayout = VK_NULL_HANDLE;
     }
+    
+    // destroy texture
+    vk::texture.destroy(vk::device);
     
     // destroy mesh
     vk::mesh.destroy(vk::device);
@@ -1849,7 +2232,7 @@ static int timer() {
 
 static void update(float seconds) {
     // advance simulation time
-    //app::time += seconds;
+    app::time += seconds;
 
     app::ubo.model = glm::rotate(glm::mat4(1.0f), (float)app::time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));
     app::ubo.view = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f));
@@ -1867,24 +2250,9 @@ static void update(float seconds) {
 static int draw() {
     vkWaitForFences(vk::device, 1, &vk::inFlightFences[vk::currentFrame], VK_TRUE, UINT64_MAX);
     
-    // just pick the first capable graphics queue to draw with.
-    int familyIndex = 0;
+    VkCommandBuffer commandBuffer{};
     VkQueue graphicsQueue{};
-    for (auto& family : vk::families) {
-        if (family.hasGraphics && family.queues > 0) {
-            vkGetDeviceQueue(vk::device, family.index, 0, &graphicsQueue);
-            break;
-        }
-        ++familyIndex;
-    }
-    if (!graphicsQueue) {
-        printlog("no suitable graphics queue for drawing");
-        return -1;
-    }
-    
-    // pick the command buffer associated with the command pool / queue family
-    assert(familyIndex < vk::commandPools.size());
-    auto& commandBuffer = vk::commandPools[familyIndex].buffers[vk::currentFrame];
+    getGraphicsQueue(graphicsQueue, commandBuffer);
     
     uint32_t imageIndex;
     auto acquireResult = vkAcquireNextImageKHR(vk::device, vk::swapChain, UINT64_MAX, vk::imageAvailableSemaphores[vk::currentFrame], VK_NULL_HANDLE, &imageIndex);
@@ -1928,18 +2296,9 @@ static int draw() {
 }
 
 static bool swap(uint32_t imageIndex) {
-    // just pick the first capable present queue
+    VkCommandBuffer commandBuffer{};
     VkQueue presentQueue{};
-    for (auto& family : vk::families) {
-        if (family.hasPresent && family.queues > 0) {
-            vkGetDeviceQueue(vk::device, family.index, 0, &presentQueue);
-            break;
-        }
-    }
-    if (!presentQueue) {
-        printlog("no suitable present queue for presentation");
-        return false;
-    }
+    getPresentQueue(presentQueue, commandBuffer);
     
     VkPresentInfoKHR presentInfo{};
     presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
