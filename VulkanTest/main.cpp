@@ -75,7 +75,7 @@ struct CommandPool {
 struct Vertex {
     alignas(16) glm::vec4 position;
     alignas(16) glm::vec4 color;
-    alignas(8) glm::vec2 texCoord;
+    alignas(8) glm::vec2 texture;
 
     static VkVertexInputBindingDescription getBindingDescription() {
         VkVertexInputBindingDescription bindingDescription{};
@@ -101,7 +101,7 @@ struct Vertex {
         attributeDescriptions[2].binding = 0;
         attributeDescriptions[2].location = 2;
         attributeDescriptions[2].format = VK_FORMAT_R32G32_SFLOAT;
-        attributeDescriptions[2].offset = offsetof(Vertex, texCoord);
+        attributeDescriptions[2].offset = offsetof(Vertex, texture);
 
         return attributeDescriptions;
     }
@@ -252,67 +252,12 @@ namespace app {
     static UniformBufferObject ubo;
     
     // mesh data
-    static const std::vector<Vertex> vertices = {
-        {
-            {-0.5f, -0.5f, -0.5f,  1.0f},
-            { 0.0f,  0.0f,  0.0f,  1.0f},
-            { 0.0f,  0.0f },
-        },
-        {
-            { 0.5f, -0.5f, -0.5f,  1.0f},
-            { 1.0f,  0.0f,  0.0f,  1.0f},
-            { 1.0f,  0.0f },
-        },
-        {
-            { 0.5f,  0.5f, -0.5f,  1.0f},
-            { 1.0f,  1.0f,  0.0f,  1.0f},
-            { 1.0f,  1.0f },
-        },
-        {
-            {-0.5f,  0.5f, -0.5f,  1.0f},
-            { 0.0f,  1.0f,  0.0f,  1.0f},
-            { 0.0f,  1.0f },
-        },
-        {
-            {-0.5f, -0.5f,  0.5f,  1.0f},
-            { 0.0f,  0.0f,  1.0f,  1.0f},
-            { 0.0f,  0.0f },
-        },
-        {
-            { 0.5f, -0.5f,  0.5f,  1.0f},
-            { 1.0f,  0.0f,  1.0f,  1.0f},
-            { 1.0f,  0.0f },
-        },
-        {
-            { 0.5f,  0.5f,  0.5f,  1.0f},
-            { 1.0f,  1.0f,  1.0f,  1.0f},
-            { 1.0f,  1.0f },
-        },
-        {
-            {-0.5f,  0.5f,  0.5f,  1.0f},
-            { 0.0f,  1.0f,  1.0f,  1.0f},
-            { 0.0f,  1.0f },
-        },
-    };
-    static const std::vector<uint16_t> indices = {
-        0, 2, 1,
-        2, 0, 3,
-        
-        4, 5, 6,
-        6, 7, 4,
-        
-        5, 4, 0,
-        5, 0, 1,
-        
-        7, 6, 2,
-        7, 2, 3,
-        
-        5, 2, 6,
-        5, 1, 2,
-        
-        4, 3, 0,
-        4, 7, 3,
-    };
+    static std::vector<Vertex> vertices;
+    static std::vector<uint16_t> indices;
+    
+    // resource paths
+    static const char* objPath = "mesh/cube/cube.obj";
+    static const char* imgPath = "mesh/cube/cube.png";
 };
 
 namespace vk {
@@ -709,7 +654,7 @@ static VkInstance createVulkanInstance() {
     appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.pEngineName = "No Engine";
     appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-    appInfo.apiVersion = VK_API_VERSION_1_0;
+    appInfo.apiVersion = VK_API_VERSION_1_3;
     
     // require specific extensions
     uint32_t glfwExtensionCount;
@@ -882,13 +827,13 @@ static VkSwapchainKHR createSwapChain(VkSwapchainKHR oldSwapChain, GLFWwindow* w
     } else {
         // if there are multiple families, share the images between all queue families.
         // this is less performant, but also less complex than transferring ownership.
-        std::vector<uint32_t> indices(families.size());
-        for (int c = 0; c < indices.size(); ++c) {
-            indices[c] = families[c].index;
+        std::vector<uint32_t> familyIndices(families.size());
+        for (int c = 0; c < familyIndices.size(); ++c) {
+            familyIndices[c] = families[c].index;
         }
         createInfo.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
-        createInfo.queueFamilyIndexCount = (uint32_t)indices.size();
-        createInfo.pQueueFamilyIndices = indices.data();
+        createInfo.queueFamilyIndexCount = (uint32_t)familyIndices.size();
+        createInfo.pQueueFamilyIndices = familyIndices.data();
     }
     
     // blending with other windows on the desktop is possible by adjusting this bit
@@ -1099,7 +1044,7 @@ static VkPipeline createGraphicsPipeline(VkDevice device, VkSampleCountFlagBits 
     rasterizer.depthBiasClamp = 0.0f; // optional if disabled
     rasterizer.depthBiasSlopeFactor = 0.0f; // optional if disabled
     
-    // TODO: multisample configuration
+    // multisample configuration
     VkPipelineMultisampleStateCreateInfo multisampling{};
     multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
     multisampling.sampleShadingEnable = VK_TRUE; // make sure deviceFeatures.sampleRateShading = VK_TRUE
@@ -1471,13 +1416,13 @@ static VkBuffer createBuffer(VkDevice device, const QueueFamilies& families, VkD
     } else {
         // if there are multiple families, share the images between all queue families.
         // this is less performant, but also less complex than transferring ownership.
-        std::vector<uint32_t> indices(families.size());
-        for (int c = 0; c < indices.size(); ++c) {
-            indices[c] = families[c].index;
+        std::vector<uint32_t> familyIndices(families.size());
+        for (int c = 0; c < familyIndices.size(); ++c) {
+            familyIndices[c] = families[c].index;
         }
         bufferInfo.sharingMode = VK_SHARING_MODE_CONCURRENT;
-        bufferInfo.queueFamilyIndexCount = (uint32_t)indices.size();
-        bufferInfo.pQueueFamilyIndices = indices.data();
+        bufferInfo.queueFamilyIndexCount = (uint32_t)familyIndices.size();
+        bufferInfo.pQueueFamilyIndices = familyIndices.data();
     }
 
     VkBuffer buffer;
@@ -1836,9 +1781,9 @@ static VkSampler createTextureSampler(VkDevice device, uint32_t mipLevels) {
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     samplerInfo.magFilter = VK_FILTER_LINEAR;
     samplerInfo.minFilter = VK_FILTER_LINEAR;
-    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
     samplerInfo.anisotropyEnable = vk::physicalDeviceProperties.limits.maxSamplerAnisotropy > 1.f ? VK_TRUE : VK_FALSE;
     samplerInfo.maxAnisotropy = vk::physicalDeviceProperties.limits.maxSamplerAnisotropy;
     samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
@@ -2421,6 +2366,132 @@ static bool recreateSwapChain() {
     return true;
 }
 
+static bool loadObj(const char* path, std::vector<Vertex>& out_vertices, std::vector<uint16_t>& out_indices) {
+    out_vertices.clear();
+    out_indices.clear();
+    
+    // open file
+    FILE* fp = fopen(path, "r");
+    if (!fp) {
+        return false;
+    }
+    enum class CoordType : uint32_t {
+        Position,
+        Texture,
+        Normal,
+        Color,
+        Max
+    };
+    constexpr auto numCoordTypes = (uint32_t)CoordType::Max;
+    
+    // count number of elements in file
+    char buf[1024];
+    std::array<uint32_t, numCoordTypes> num_coords{0};
+    std::array<uint32_t, numCoordTypes> num_indices{0};
+    while (fgets(buf, sizeof(buf), fp)) {
+        if (buf[0] != '#' && buf[0] != '\n') {
+            char* type = strtok(buf, " ");
+            if (strcmp(type, "v") == 0) {
+                ++num_coords[(uint32_t)CoordType::Position];
+            }
+            else if (strcmp(type, "vt") == 0) {
+                ++num_coords[(uint32_t)CoordType::Texture];
+            }
+            else if (strcmp(type, "vn") == 0) {
+                ++num_coords[(uint32_t)CoordType::Normal];
+            }
+            else if (strcmp(type, "f") == 0) {
+                char *token;
+                while ((token = strtok(nullptr, " "))) {
+                    for (uint32_t c = 0; c < (uint32_t)CoordType::Max; ++c) {
+                        num_indices[c] += 3;
+                    }
+                }
+                for (uint32_t c = 0; c < (uint32_t)CoordType::Max; ++c) {
+                    num_indices[c] -= 6;
+                }
+            }
+        }
+    }
+    rewind(fp);
+    
+    // parse file
+    std::vector<glm::vec4> coords[numCoordTypes];
+    std::vector<uint16_t> indices[numCoordTypes];
+    for (uint32_t c = 0; c < numCoordTypes; ++c) {
+        coords[c].resize(num_coords[c]);
+        indices[c].resize(num_indices[c]);
+    }
+    uint32_t indices_count[numCoordTypes] = {0}, coords_count[numCoordTypes] = {0};
+    while (fgets(buf, sizeof(buf), fp)) {
+        if (buf[0] != '#' && buf[0] != '\n') {
+            char* type = strtok(buf, " ");
+            if (strcmp(type, "v") == 0) {
+                char* c1 = strtok(nullptr, " "); float f1 = strtof(c1, nullptr);
+                char* c2 = strtok(nullptr, " "); float f2 = strtof(c2, nullptr);
+                char* c3 = strtok(nullptr, " "); float f3 = strtof(c3, nullptr);
+                coords[(uint32_t)CoordType::Position][coords_count[(uint32_t)CoordType::Position]++] = glm::vec4{f1, f2, f3, 1.f};
+            }
+            else if (strcmp(type, "vt") == 0) {
+                char* c1 = strtok(nullptr, " "); float f1 = strtof(c1, nullptr);
+                char* c2 = strtok(nullptr, " "); float f2 = strtof(c2, nullptr);
+                coords[(uint32_t)CoordType::Texture][coords_count[(uint32_t)CoordType::Texture]++] = glm::vec4{f1, 1.f - f2, 0.f, 0.f}; // flip the Y coordinate because its upside-down for some reason?
+            }
+            else if (strcmp(type, "vn") == 0) {
+                char* c1 = strtok(nullptr, " "); float f1 = strtof(c1, nullptr);
+                char* c2 = strtok(nullptr, " "); float f2 = strtof(c2, nullptr);
+                char* c3 = strtok(nullptr, " "); float f3 = strtof(c3, nullptr);
+                coords[(uint32_t)CoordType::Normal][coords_count[(uint32_t)CoordType::Normal]++] = glm::vec4{fabs(f1), fabs(f2), fabs(f3), 1.f}; // these will secretly be used for COLOR so let's just hack this
+            }
+            else if (strcmp(type, "f") == 0) {
+                int index = 0;
+                uint32_t first_index[numCoordTypes];
+                uint32_t last_index[numCoordTypes];
+                for (int c = 0; c < numCoordTypes; ++c) {
+                    first_index[c] = indices_count[c];
+                }
+                char *token;
+                while ((token = strtok(nullptr, " "))) {
+                    if (++index > 3) {
+                        for (uint32_t c = 0; c < numCoordTypes; ++c) {
+                            indices[c][indices_count[c]++] = indices[c][first_index[c]];
+                            indices[c][indices_count[c]++] = indices[c][last_index[c]];
+                        }
+                    }
+                    char* slice = token;
+                    for (int c = 0; c < numCoordTypes; ++c) {
+                        uint32_t index = (uint32_t)strtol(slice, nullptr, 10) - 1;
+                        last_index[c] = indices_count[c];
+                        indices[c][indices_count[c]++] = index;
+                        if ((slice = strchr(slice, '/'))) {
+                            ++slice;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    fclose(fp);
+    
+    // fill vertex data cache (note: duplicates vertices)
+    const auto size = (uint16_t)indices[0].size();
+    out_indices.reserve(size);
+    out_vertices.reserve(size);
+    for (uint16_t c = 0; c < size; ++c) {
+        Vertex v{};
+        v.position = coords[(uint16_t)CoordType::Position][indices[(uint16_t)CoordType::Position][c]];
+        v.texture = coords[(uint16_t)CoordType::Texture][indices[(uint16_t)CoordType::Texture][c]];
+        v.color = coords[(uint16_t)CoordType::Normal][indices[(uint16_t)CoordType::Normal][c]];
+        out_indices.push_back(c);
+        out_vertices.push_back(v);
+    }
+    
+    // success
+    return true;
+}
+
 static bool initVulkan(GLFWwindow* window) {
     // initialize vulkan instance
     vk::instance = createVulkanInstance();
@@ -2486,8 +2557,7 @@ static bool initVulkan(GLFWwindow* window) {
     }
     
     // load texture
-    vk::texture = createTexture(vk::device, vk::physicalDevice, vk::families,
-        "mesh/cube/cube.png");
+    vk::texture = createTexture(vk::device, vk::physicalDevice, vk::families, app::imgPath);
     if (vk::texture.sampler == VK_NULL_HANDLE) {
         return false;
     }
@@ -2504,6 +2574,11 @@ static bool initVulkan(GLFWwindow* window) {
     
     // create swap chain, image views, render pass, pipeline, and framebuffer
     if (!recreateSwapChain()) {
+        return false;
+    }
+    
+    // load mesh obj
+    if (!loadObj(app::objPath, app::vertices, app::indices)) {
         return false;
     }
     
@@ -2664,9 +2739,10 @@ static void update(float seconds) {
     // advance simulation time
     app::time += seconds;
 
-    app::ubo.model = glm::rotate(glm::mat4(1.0f), (float)app::time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));
-    app::ubo.view = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f));
-    app::ubo.proj = glm::perspective(glm::radians(45.0f), vk::swapChainExtent.width / (float) vk::swapChainExtent.height, 0.1f, 10.0f);
+    constexpr float distance = 4.f;
+    app::ubo.model = glm::rotate(glm::mat4(1.f), (float)app::time * glm::radians(90.f), glm::vec3(0.f, 1.f, 0.f));
+    app::ubo.view = glm::lookAt(glm::vec3(distance, distance, distance), glm::vec3(0.f, 0.f, 0.f), glm::vec3(0.f, 1.f, 0.f));
+    app::ubo.proj = glm::perspective(glm::radians(45.f), vk::swapChainExtent.width / (float) vk::swapChainExtent.height, .1f, 1000.f);
     
     // in GL +Y = Up but in Vulkan +Y = Down.
     // This flips the projection matrix so the image appears rightside up.
